@@ -10,12 +10,27 @@ under `skills/erpclaw/`.
 
 ## Installing on Hermes
 
-The one-command `hermes skills install` is not available yet. The Hermes runtime
-audits skills and blocks any that run system commands, which ERPClaw does by
-design: its accounting engine is local Python invoked through a command router.
-A verified publish that clears this audit is planned.
+Add this tap, then install with `--force`:
 
-Until then, install manually by cloning the skill and initializing its database:
+```
+hermes skills tap add avansaber/hermes-skills
+hermes skills install hermes-skills/erpclaw --force
+```
+
+Why `--force`: the Hermes security audit rates ERPClaw "caution" because its
+accounting engine runs local commands by design (every action is local Python
+invoked through a command router; nothing leaves your machine). The flag
+acknowledges that caution rating. Use the tap-qualified name shown above; a
+bare `install erpclaw` may resolve to a stale listing elsewhere.
+
+Then point ERPClaw at a data directory and initialize its database:
+
+```
+export ERPCLAW_HOME=~/.hermes/erpclaw-home
+python3 ~/.hermes/skills/erpclaw/scripts/erpclaw-setup/db_query.py --action initialize-database
+```
+
+Prefer not to use `--force`? The manual install works identically:
 
 ```
 git clone https://github.com/avansaber/erpclaw ~/.hermes/skills/erp/erpclaw
@@ -30,8 +45,11 @@ hermes chat -s erpclaw --yolo -q "Set up my company"
 ```
 
 Recommended: `hermes curator pin erpclaw` so the skill stays exactly as
-installed. Credential and encrypted-backup features are outside the experimental
-Hermes scope for now; avoid them there.
+installed. Credential values never pass through the agent on any runtime:
+lookups return existence plus a redacted preview only, and high-impact actions
+(restores, credential changes, master-key operations) always require an
+explicit confirmation flag. Hermes support overall remains experimental and
+best-effort.
 
 ## Contents
 
