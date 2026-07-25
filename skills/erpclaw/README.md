@@ -109,7 +109,7 @@ ERPClaw runs on OpenClaw (primary). Experimental support for the Hermes Agent ru
 
   ```bash
   hermes skills tap add avansaber/hermes-skills
-  hermes skills install hermes-skills/erpclaw --force
+  hermes skills install avansaber/hermes-skills/skills/erpclaw --force
   export ERPCLAW_HOME=~/.hermes/erpclaw-home    # blank = ~/.openclaw/erpclaw
   python3 ~/.hermes/skills/erpclaw/scripts/erpclaw-setup/db_query.py --action initialize-database
   ```

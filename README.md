@@ -14,7 +14,7 @@ Add this tap, then install with `--force`:
 
 ```
 hermes skills tap add avansaber/hermes-skills
-hermes skills install hermes-skills/erpclaw --force
+hermes skills install avansaber/hermes-skills/skills/erpclaw --force
 ```
 
 Why `--force`: the Hermes security audit rates ERPClaw "caution" because its
