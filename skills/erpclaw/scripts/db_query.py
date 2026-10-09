@@ -25,6 +25,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # dev-tree lib exists), so these reproduce the resolver's logic inline rather
 # than importing it — equivalent to erpclaw_lib.paths.modules_dir()/db_default().
 # With ERPCLAW_HOME unset they equal today's ~/.openclaw/erpclaw literals exactly.
+# erpclaw_lib is otherwise imported lazily, inside lookup_module_for_action, for tier 3 on PostgreSQL only.
 _ERPCLAW_HOME = os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw"))
 MODULES_DIR = os.path.join(_ERPCLAW_HOME, "modules")
 DB_PATH = os.path.join(_ERPCLAW_HOME, "data.sqlite")
@@ -32,12 +33,21 @@ BUNDLED_LIB = os.path.join(BASE_DIR, "erpclaw-setup", "lib")
 if os.path.isdir(os.path.join(BUNDLED_LIB, "erpclaw_lib")):
     sys.path.insert(0, BUNDLED_LIB)
 
+# Read-only storage (erpclaw_lib.db.readonly_requested). The router does not
+# import the lib, so it reads the flag inline. Any non-empty value counts: "1"
+# is read-only, and anything else is refused by the lib in the domain script,
+# so the router never does a write on the way there.
+_READONLY = os.environ.get("ERPCLAW_DB_READONLY", "") != ""
+
 
 def _chmod_db_files_action() -> None:
     """Lock down DB file perms to 600 on every action invocation.
 
-    Idempotent. Covers data.sqlite + WAL + SHM. Cheap (~30µs).
+    Idempotent. Covers data.sqlite + WAL + SHM. Cheap (~30µs). Skipped under
+    read-only storage: a read changes nothing, not even a mode bit.
     """
+    if _READONLY:
+        return
     for suffix in ("", "-wal", "-shm"):
         path = DB_PATH + suffix
         try:
@@ -57,9 +67,10 @@ def _log_action_call(action_name, routed_to, route_tier):
     """Log an action call to action_call_log for L2 test verification.
 
     Only logs when ERPCLAW_TEST_SESSION env var is set (test mode).
-    Silently ignores errors to never break normal operation.
+    Silently ignores errors to never break normal operation. Never writes
+    under read-only storage.
     """
-    if not _SESSION_ID:
+    if not _SESSION_ID or _READONLY:
         return
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -73,11 +84,11 @@ def _log_action_call(action_name, routed_to, route_tier):
     except Exception:
         pass  # Never break normal operation
 
-# Action → domain mapping (365 core entries + aliases + 10 module mgmt)
+# Action → domain mapping (366 core entries + aliases + 10 module mgmt)
 # Collisions resolved: status→setup, recurring-template→journals,
 # update-invoice-outstanding→selling. Aliases added for alternate domains.
 ACTION_MAP = {
-    # === Setup (42 actions) ===
+    # === Setup (43 actions) ===
     "initialize-database": "erpclaw-setup",
     "setup-company": "erpclaw-setup",
     "update-company": "erpclaw-setup",
@@ -95,6 +106,8 @@ ACTION_MAP = {
     "add-uom-conversion": "erpclaw-setup",
     "seed-defaults": "erpclaw-setup",
     "get-audit-log": "erpclaw-setup",
+    "get-system-audit-log": "erpclaw-setup",
+    "get-audit-checkpoint": "erpclaw-setup",
     "get-schema-version": "erpclaw-setup",
     "update-regional-settings": "erpclaw-setup",
     "backup-database": "erpclaw-setup",
@@ -113,6 +126,11 @@ ACTION_MAP = {
     "list-roles": "erpclaw-setup",
     "assign-role": "erpclaw-setup",
     "revoke-role": "erpclaw-setup",
+    "grant-company-membership": "erpclaw-setup",
+    "deny-company-membership": "erpclaw-setup",
+    "revoke-company-membership": "erpclaw-setup",
+    "list-company-memberships": "erpclaw-setup",
+    "reconcile-legacy-company-scope": "erpclaw-setup",
     "set-password": "erpclaw-setup",
     "seed-permissions": "erpclaw-setup",
     "set-credential": "erpclaw-setup",
@@ -125,10 +143,14 @@ ACTION_MAP = {
     "unlink-telegram-user": "erpclaw-setup",
     "check-telegram-permission": "erpclaw-setup",
     "onboarding-step": "erpclaw-setup",
+    "issue-authorization": "erpclaw-setup",
+    "revoke-authorization": "erpclaw-setup",
+    "get-authorization": "erpclaw-setup",
 
     # === Meta (4 actions) ===
     "check-installation": "erpclaw-meta",
     "install-guide": "erpclaw-meta",
+    "evaluate-rule": "erpclaw-meta",
     "seed-demo-data": "erpclaw-meta",
     # setup-web-dashboard moved to erpclaw-os-engine addon as os-setup-web-dashboard
     # (2026-05-04 split per CLAWHUB_FIX_C_PLAN; bare name now returns missing-addon error)
@@ -163,8 +185,10 @@ ACTION_MAP = {
     "import-opening-balances": "erpclaw-gl",
     "gl-status": "erpclaw-gl",
 
-    # === Journal Entries (17 actions) ===
+    # === Journal Entries (21 actions) ===
     "add-journal-entry": "erpclaw-journals",
+    "create-expense-allocation": "erpclaw-journals",
+    "add-interfund-transfer": "erpclaw-journals",
     "update-journal-entry": "erpclaw-journals",
     "get-journal-entry": "erpclaw-journals",
     "list-journal-entries": "erpclaw-journals",
@@ -175,15 +199,20 @@ ACTION_MAP = {
     "duplicate-journal-entry": "erpclaw-journals",
     "create-intercompany-je": "erpclaw-journals",
     "add-recurring-template": "erpclaw-journals",
+    "add-expense-schedule": "erpclaw-journals",
     "update-recurring-template": "erpclaw-journals",
     "list-recurring-templates": "erpclaw-journals",
     "get-recurring-template": "erpclaw-journals",
     "process-recurring": "erpclaw-journals",
     "delete-recurring-template": "erpclaw-journals",
+    "journal-month-end-close-preview": "erpclaw-journals",
+    "journal-run-month-end-close": "erpclaw-journals",
     "journals-status": "erpclaw-journals",
 
-    # === Payments (15 actions) ===
+    # === Payments (17 actions) ===
     "add-payment": "erpclaw-payments",
+    "preview-cash-application": "erpclaw-payments",
+    "create-cash-application-payment": "erpclaw-payments",
     "update-payment": "erpclaw-payments",
     "get-payment": "erpclaw-payments",
     "list-payments": "erpclaw-payments",
@@ -219,7 +248,7 @@ ACTION_MAP = {
     "generate-1099-data": "erpclaw-tax",
     "tax-status": "erpclaw-tax",
 
-    # === Financial Reports (21 actions) ===
+    # === Financial Reports (22 actions) ===
     "trial-balance": "erpclaw-reports",
     "profit-and-loss": "erpclaw-reports",
     "balance-sheet": "erpclaw-reports",
@@ -229,12 +258,15 @@ ACTION_MAP = {
     "ap-aging": "erpclaw-reports",
     "budget-vs-actual": "erpclaw-reports",
     "budget-variance": "erpclaw-reports",
+    "flux-variance-narrative": "erpclaw-reports",
     "party-ledger": "erpclaw-reports",
     "tax-summary": "erpclaw-reports",
     "payment-summary": "erpclaw-reports",
     "gl-summary": "erpclaw-reports",
     "comparative-pl": "erpclaw-reports",
     "check-overdue": "erpclaw-reports",
+    "weekly-digest": "erpclaw-reports",
+    "continuous-close-readiness": "erpclaw-reports",
     "add-elimination-rule": "erpclaw-reports",
     "list-elimination-rules": "erpclaw-reports",
     "run-elimination": "erpclaw-reports",
@@ -253,6 +285,7 @@ ACTION_MAP = {
     "submit-quotation": "erpclaw-selling",
     "convert-quotation-to-so": "erpclaw-selling",
     "add-sales-order": "erpclaw-selling",
+    "add-inbox-order": "erpclaw-selling",
     "update-sales-order": "erpclaw-selling",
     "get-sales-order": "erpclaw-selling",
     "list-sales-orders": "erpclaw-selling",
@@ -269,6 +302,7 @@ ACTION_MAP = {
     "list-sales-invoices": "erpclaw-selling",
     "submit-sales-invoice": "erpclaw-selling",
     "cancel-sales-invoice": "erpclaw-selling",
+    "delete-sales-invoice": "erpclaw-selling",
     "create-credit-note": "erpclaw-selling",
     "list-credit-notes": "erpclaw-selling",
     "update-invoice-outstanding": "erpclaw-selling",
@@ -298,7 +332,9 @@ ACTION_MAP = {
     "get-packing-slip": "erpclaw-selling",
     "list-packing-slips": "erpclaw-selling",
 
-    # === Buying / Procure-to-Pay (36 actions) ===
+    # === Buying / Procure-to-Pay (62 actions) ===
+    "add-commitment-worksheet": "erpclaw-buying",
+    "get-commitment-worksheet": "erpclaw-buying",
     "add-supplier": "erpclaw-buying",
     "update-supplier": "erpclaw-buying",
     "get-supplier": "erpclaw-buying",
@@ -309,6 +345,8 @@ ACTION_MAP = {
     "get-material-request": "erpclaw-buying",
     "create-po-from-material-request": "erpclaw-buying",
     "add-rfq": "erpclaw-buying",
+    "create-rfq-supplier-request": "erpclaw-buying",
+    "list-rfq-supplier-requests": "erpclaw-buying",
     "submit-rfq": "erpclaw-buying",
     "list-rfqs": "erpclaw-buying",
     "add-supplier-quotation": "erpclaw-buying",
@@ -326,6 +364,9 @@ ACTION_MAP = {
     "submit-purchase-receipt": "erpclaw-buying",
     "cancel-purchase-receipt": "erpclaw-buying",
     "create-purchase-invoice": "erpclaw-buying",
+    "add-vendor-bill-intake": "erpclaw-buying",
+    "capture-vendor-bill": "erpclaw-buying",
+    "add-captured-vendor-bill": "erpclaw-buying",
     "update-purchase-invoice": "erpclaw-buying",
     "get-purchase-invoice": "erpclaw-buying",
     "list-purchase-invoices": "erpclaw-buying",
@@ -336,6 +377,7 @@ ACTION_MAP = {
     "add-landed-cost-voucher": "erpclaw-buying",
     "list-landed-cost-vouchers": "erpclaw-buying",
     "get-landed-cost-voucher": "erpclaw-buying",
+    "list-landed-cost-voucher-anomalies": "erpclaw-buying",
     "cancel-landed-cost-voucher": "erpclaw-buying",
     "import-suppliers": "erpclaw-buying",
     "buying-status": "erpclaw-buying",
@@ -350,6 +392,7 @@ ACTION_MAP = {
     "create-po-from-so": "erpclaw-buying",
     "add-recurring-bill-template": "erpclaw-buying",
     "list-recurring-bill-templates": "erpclaw-buying",
+    "update-recurring-bill-template": "erpclaw-buying",
     "generate-recurring-bills": "erpclaw-buying",
     "set-item-purchase-uom": "erpclaw-buying",
 
@@ -362,9 +405,14 @@ ACTION_MAP = {
     "add-item-group": "erpclaw-inventory",
     "list-item-groups": "erpclaw-inventory",
     "add-warehouse": "erpclaw-inventory",
+    "add-bin-location": "erpclaw-inventory",
     "update-warehouse": "erpclaw-inventory",
     "list-warehouses": "erpclaw-inventory",
     "add-stock-entry": "erpclaw-inventory",
+    "add-location-resupply": "erpclaw-inventory",
+    "add-item-barcode": "erpclaw-inventory",
+    "add-scanned-stock-entry": "erpclaw-inventory",
+    "add-scanned-stock-count": "erpclaw-inventory",
     "add-repack-stock-entry": "erpclaw-inventory",
     "add-material-consumption": "erpclaw-inventory",
     "get-stock-entry": "erpclaw-inventory",
@@ -396,6 +444,8 @@ ACTION_MAP = {
     "cancel-stock-revaluation": "erpclaw-inventory",
     "check-reorder": "erpclaw-inventory",
     "import-items": "erpclaw-inventory",
+    "inventory-demand-forecast": "erpclaw-inventory",
+    "standard-cost-variance-report": "erpclaw-inventory",
     "inventory-status": "erpclaw-inventory",
     "get-projected-qty": "erpclaw-inventory",
     "add-item-attribute": "erpclaw-inventory",
@@ -410,6 +460,7 @@ ACTION_MAP = {
     "update-putaway-rule": "erpclaw-inventory",
     "delete-putaway-rule": "erpclaw-inventory",
     "apply-putaway-on-receipt": "erpclaw-inventory",
+    "create-putaway-transfer": "erpclaw-inventory",
     "create-pick-list": "erpclaw-inventory",
     "add-pick-list-item": "erpclaw-inventory",
     "submit-pick-list": "erpclaw-inventory",
@@ -455,7 +506,7 @@ ACTION_MAP = {
     "resume-billing-run": "erpclaw-billing",
     "billing-status": "erpclaw-billing",
 
-    # === Advanced Accounting — Revenue Recognition / ASC 606 (17 actions) ===
+    # === Advanced Accounting — Revenue Recognition / ASC 606 (18 actions) ===
     "add-revenue-contract": "erpclaw-accounting-adv",
     "update-revenue-contract": "erpclaw-accounting-adv",
     "get-revenue-contract": "erpclaw-accounting-adv",
@@ -468,10 +519,12 @@ ACTION_MAP = {
     "list-variable-considerations": "erpclaw-accounting-adv",
     "modify-contract": "erpclaw-accounting-adv",
     "calculate-revenue-schedule": "erpclaw-accounting-adv",
+    "calculate-revenue-progress": "erpclaw-accounting-adv",
     "generate-revenue-entries": "erpclaw-accounting-adv",
     "update-schedule-amounts": "erpclaw-accounting-adv",
     "recognize-schedule-entry": "erpclaw-accounting-adv",
     "revenue-waterfall-report": "erpclaw-accounting-adv",
+    "contract-balance-report": "erpclaw-accounting-adv",
     "revenue-recognition-summary": "erpclaw-accounting-adv",
 
     # === Advanced Accounting — Lease Accounting / ASC 842 (12 actions) ===
@@ -500,7 +553,7 @@ ACTION_MAP = {
     "ic-reconciliation-report": "erpclaw-accounting-adv",
     "ic-elimination-report": "erpclaw-accounting-adv",
 
-    # === Advanced Accounting — Multi-Entity Consolidation (8 actions) ===
+    # === Advanced Accounting — Multi-Entity Consolidation (11 actions) ===
     "add-consolidation-group": "erpclaw-accounting-adv",
     "list-consolidation-groups": "erpclaw-accounting-adv",
     "add-group-entity": "erpclaw-accounting-adv",
@@ -508,13 +561,15 @@ ACTION_MAP = {
     "generate-elimination-entries": "erpclaw-accounting-adv",
     "add-currency-translation": "erpclaw-accounting-adv",
     "consolidation-trial-balance-report": "erpclaw-accounting-adv",
+    "consolidation-translation-report": "erpclaw-accounting-adv",
     "consolidation-summary": "erpclaw-accounting-adv",
     # M114: surface + correct the pre-M95 elimination-duplication surplus.
     "list-elimination-surplus": "erpclaw-accounting-adv",
     "remove-elimination-surplus": "erpclaw-accounting-adv",
 
-    # === Advanced Accounting — Reports (1 action) ===
+    # === Advanced Accounting — Reports (2 actions) ===
     "standards-compliance-dashboard": "erpclaw-accounting-adv",
+    "calculate-benefit-liability": "erpclaw-accounting-adv",
 
     # === HR — Employee Management (28 actions) ===
     "add-employee": "erpclaw-hr",
@@ -576,6 +631,8 @@ ACTION_MAP = {
     "submit-payroll-run": "erpclaw-payroll",
     "cancel-payroll-run": "erpclaw-payroll",
     "generate-w2-data": "erpclaw-payroll",
+    "generate-form941-data": "erpclaw-payroll",
+    "generate-form940-data": "erpclaw-payroll",
     "add-garnishment": "erpclaw-payroll",
     "update-garnishment": "erpclaw-payroll",
     "list-garnishments": "erpclaw-payroll",
@@ -671,6 +728,8 @@ ACTION_MAP = {
     "place-customer-on-hold": "erpclaw-selling",
     "add-dunning-level": "erpclaw-selling",
     "run-dunning-cycle": "erpclaw-selling",
+    "set-follow-up-threshold": "erpclaw-selling",
+    "run-follow-up-cycle": "erpclaw-selling",
     "list-dunning-runs": "erpclaw-selling",
     # Payments — advance handling.
     "apply-advance-to-invoice": "erpclaw-payments",
@@ -678,6 +737,9 @@ ACTION_MAP = {
     # Reports — multi-dimensional reporting.
     "multi-dim-trial-balance": "erpclaw-reports",
     "dimension-balance-report": "erpclaw-reports",
+    "nonprofit-statement-set": "erpclaw-reports",
+    "sefa-readiness-report": "erpclaw-reports",
+    "governmental-statement-set": "erpclaw-reports",
 }
 
 # Aliases: actions that need to be forwarded with a different --action name
@@ -765,6 +827,26 @@ DANGEROUS_ACTIONS = frozenset({
     # forgiving the same debt was not. `legal-write-off-invoice` is listed with
     # it because the two are one operation across the delegation hop.
     "write-off-invoice", "legal-write-off-invoice",
+    # Educlaw fee billing. Both actions submit a sales invoice through
+    # cross_skill.submit_invoice, which passes --user-confirmed on to the
+    # gated submit-sales-invoice, so the confirmation must be the one the
+    # caller gave for the educlaw action.
+    "edu-generate-fee-invoice", "edu-apply-late-fee",
+    # Catering completion submits a sales invoice through
+    # cross_skill.submit_invoice, which passes --user-confirmed on to the
+    # gated submit-sales-invoice, so the confirmation must be the one the
+    # caller gave for the FoodClaw action.
+    "food-complete-catering-event",
+    # Catering deposit submits a payment with --user-confirmed, so the confirmation must be the caller's.
+    "food-receive-catering-deposit",
+    # PropertyClaw rent billing. prop-generate-charges submits a sales invoice
+    # through cross_skill.submit_invoice, which passes --user-confirmed on to
+    # the gated submit-sales-invoice, so the confirmation must be the one the
+    # caller gave for the PropertyClaw action.
+    "prop-generate-charges",
+    # PropertyClaw rent payment. prop-process-rent-payment submits, and may
+    # delete, a payment with --user-confirmed.
+    "prop-process-rent-payment",
     # Tax
     "delete-tax-template",
     # Reports / consolidation that mutate. `run-elimination` left this set when
@@ -777,7 +859,7 @@ DANGEROUS_ACTIONS = frozenset({
     # Selling lifecycle
     "submit-quotation", "submit-sales-order", "cancel-sales-order",
     "submit-delivery-note", "cancel-delivery-note",
-    "submit-sales-invoice", "cancel-sales-invoice",
+    "submit-sales-invoice", "cancel-sales-invoice", "delete-sales-invoice",
     "cancel-intercompany-invoice", "submit-blanket-order",
     # Buying lifecycle
     "submit-material-request", "submit-rfq",
@@ -787,6 +869,11 @@ DANGEROUS_ACTIONS = frozenset({
     "submit-blanket-po",
     # Inventory mutations
     "submit-stock-entry", "cancel-stock-entry",
+    # Actions that carry a confirmation on to a gated action in another module.
+    # The flag may be passed on only by an action that required it itself.
+    "transfer-materials-to-subcontractor", "cancel-subcontract-transfer",
+    "pos-submit-transaction", "pos-abandon-posting", "pos-void-transaction", "pos-return-transaction", "construction-approve-progress-bill",
+    "legal-generate-invoice", "legal-send-invoice",
     "submit-stock-reconciliation", "cancel-stock-revaluation",
     # Wave 2 M5: pick-list lifecycle that creates/consumes/releases hard
     # reservations (and complete-pick-list generates a delivery note).
@@ -806,6 +893,9 @@ DANGEROUS_ACTIONS = frozenset({
     "cleanup-backups",
     # RBAC + identity changes
     "set-password", "add-role", "assign-role", "revoke-role", "seed-permissions",
+    "grant-company-membership", "deny-company-membership",
+    "revoke-company-membership",
+    "issue-authorization", "revoke-authorization",
     "update-user",
     # Credential management
     "set-credential", "delete-credential", "migrate-credentials",
@@ -821,6 +911,81 @@ DANGEROUS_ACTIONS = frozenset({
     # Initialize-database --force
     "initialize-database",
 })
+
+
+def _ACTION_OPT_FORMS() -> frozenset:
+    return frozenset({"--action"})
+
+
+_ACTION_ABBREV_OPTS = frozenset({"--a", "--ac", "--act", "--acti", "--actio"})
+
+_FORCE_ABBREV_OPTS = frozenset({"--f", "--fo", "--for", "--forc"})
+
+
+def _split_opt(token: str):
+    if "=" in token:
+        opt, _, val = token.partition("=")
+        return opt, val
+    return token, None
+
+
+def _is_action_opt(opt: str) -> bool:
+    return opt == "--action" or opt in _ACTION_ABBREV_OPTS
+
+
+def _is_force_opt(opt: str) -> bool:
+    return opt == "--force" or opt in _FORCE_ABBREV_OPTS
+
+
+def _routing_error(message: str, action=None) -> None:
+    payload = {"status": "error", "error": message}
+    if action is not None:
+        payload["action"] = action
+    print(json.dumps(payload))
+    sys.exit(1)
+
+
+def _validate_and_normalize_routing_argv() -> None:
+    raw = list(sys.argv[1:])
+    selectors = []
+    for i, tok in enumerate(raw):
+        if not tok.startswith("--"):
+            continue
+        opt, val = _split_opt(tok)
+        if _is_action_opt(opt):
+            if val is not None:
+                selectors.append((i, "equals", val, tok, opt))
+            else:
+                nxt = raw[i + 1] if i + 1 < len(raw) else None
+                selectors.append((i, "separate", nxt, tok, opt))
+    if len(selectors) > 1:
+        _routing_error("ambiguous_action: multiple --action selectors refused")
+    if len(selectors) == 1:
+        idx, kind, value, tok, opt = selectors[0]
+        if opt != "--action":
+            _routing_error("ambiguous_action: abbreviated action switch refused")
+        if kind == "equals":
+            _routing_error("ambiguous_action: --action=value spelling refused; use '--action VALUE'")
+        if value is None or value == "":
+            _routing_error("ambiguous_action: missing --action value refused")
+        if isinstance(value, str) and value.startswith("-"):
+            _routing_error("ambiguous_action: missing --action value refused")
+    selected = None
+    if len(selectors) == 1:
+        _idx, _kind, _value, _tok, _opt = selectors[0]
+        selected = _value
+    if selected != "initialize-database":
+        return
+    for i, tok in enumerate(raw):
+        if not tok.startswith("--"):
+            continue
+        opt, val = _split_opt(tok)
+        if not _is_force_opt(opt):
+            continue
+        if opt != "--force":
+            _routing_error("ambiguous_force: abbreviated force spelling refused; use exact --force")
+        if val is not None:
+            _routing_error("ambiguous_force: --force does not take a value")
 
 
 def _is_user_confirmed() -> bool:
@@ -873,8 +1038,11 @@ def _maybe_check_drift_reminder(action):
     Read-only; never modifies files. The user invokes `update-foundation
     --user-confirmed` explicitly to reconcile. At most one reminder per
     24-hour window per install. Best-effort: silent on any failure; never
-    blocks dispatch.
+    blocks dispatch. Skipped under read-only storage (no git run, no marker
+    write).
     """
+    if _READONLY:
+        return
     if action in SYNC_RECURSION_GUARD:
         return
     if "--no-reconcile-check" in sys.argv:
@@ -1039,17 +1207,71 @@ def _suggest_module_for_action(action):
     return None
 
 
+def _pg_module_action_target():
+    """Return the PostgreSQL target for tier 3, or None on a file install.
+
+    Reads the environment only: the ERPCLAW_DB_URL value when set, else the
+    ERPCLAW_DB_PATH value when it names a PostgreSQL URL, else None. The
+    SQLite fast path keeps its direct connection so a file install pays no
+    import cost.
+    """
+    url = os.environ.get("ERPCLAW_DB_URL", "")
+    if url:
+        return url
+    path = os.environ.get("ERPCLAW_DB_PATH", "")
+    if path.startswith("postgresql://") or path.startswith("postgres://"):
+        return path
+    return None
+
+
 def lookup_module_for_action(action):
     """Query erpclaw_module_action table to find which module owns this action.
 
     Returns the module_name if found, None otherwise.
-    Uses a direct sqlite3 connection (not shared lib) to avoid import overhead.
+    The SQLite fast path keeps a direct connection to avoid import cost;
+    on PostgreSQL the lookup resolves through the seam (erpclaw_lib.db).
     """
+    if _pg_module_action_target() is not None:
+        try:
+            from erpclaw_lib import db as _seam_db
+        except ImportError:
+            return None
+        _error_types = getattr(_seam_db, "db_error_types", None)
+        if _error_types is None:
+            _db_error = sqlite3.Error
+        else:
+            _db_error = _error_types()[1]
+        try:
+            conn = _seam_db.get_connection()
+            try:
+                row = conn.execute(
+                    """SELECT ma.module_name
+                       FROM erpclaw_module_action ma
+                       JOIN erpclaw_module m ON m.name = ma.module_name
+                       WHERE ma.action_name = ?
+                         AND m.install_status = 'installed'
+                         AND m.is_active = 1
+                       LIMIT 1""",
+                    (action,)
+                ).fetchone()
+            finally:
+                conn.close()
+        except _db_error:
+            # Missing table or other DB issue — fall through, as on SQLite.
+            return None
+        if row:
+            return row["module_name"]
+        return None
     if not os.path.isfile(DB_PATH):
         return None
 
     try:
-        conn = sqlite3.connect(DB_PATH)
+        target, as_uri = DB_PATH, False
+        if _READONLY:
+            from urllib.parse import quote as _quote
+            target = "file:" + _quote(os.path.abspath(DB_PATH), safe="/") + "?mode=ro"
+            as_uri = True
+        conn = sqlite3.connect(target, uri=as_uri)
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """SELECT ma.module_name
@@ -1070,7 +1292,376 @@ def lookup_module_for_action(action):
     return None
 
 
+def _refuse_invalid_actor_context():
+    """Refuse a malformed actor context before anything is dispatched.
+
+    A value that is present but malformed turns tampering into a loud error;
+    no legitimate launcher writes one. A valid context passes through the
+    later execvp unchanged.
+    """
+    if "ERPCLAW_ACTOR_CONTEXT" not in os.environ:
+        return
+    import importlib.util
+    if importlib.util.find_spec("erpclaw_lib") is None:
+        sys.path.insert(0, os.path.join(_ERPCLAW_HOME, "lib"))
+    try:
+        from erpclaw_lib import actor
+        bad = actor.current().status == "invalid"
+    except Exception:
+        bad = True
+    if bad:
+        print(json.dumps({
+            "status": "error",
+            "error": "ACTOR_CONTEXT_INVALID",
+            "message": ("The actor context passed to this command is "
+                        "malformed, so nothing was run."),
+        }))
+        sys.exit(1)
+
+
+def _readonly_db_mismatch_refusal(where, message=None):
+    print(json.dumps({
+        "status": "error",
+        "error": "read_only_db_mismatch",
+        "message": message or ("ERPCLAW_DB_READONLY=1 requires %s to be "
+                               "$ERPCLAW_HOME/data.sqlite." % where),
+    }))
+    sys.exit(1)
+
+
+def _argv_db_paths(option="--db-path"):
+    """Every ``option`` value on the command line, abbreviations included.
+
+    A domain parser accepts any unambiguous prefix of ``--db-path`` (for
+    example ``--db``), so each prefix counts. A prefix given without a value
+    yields None, which never matches a path.
+    """
+    raw = list(sys.argv[1:])
+    found = []
+    for i, tok in enumerate(raw):
+        if not tok.startswith("--"):
+            continue
+        opt, val = _split_opt(tok)
+        if len(opt) < 3 or not option.startswith(opt):
+            continue
+        if val is None:
+            val = raw[i + 1] if i + 1 < len(raw) else None
+        found.append((opt, val))
+    return found
+
+
+def _refuse_readonly_db_mismatch():
+    """Under read-only storage, the router and the domain script read one file.
+
+    The router's own lookups use ``$ERPCLAW_HOME/data.sqlite``; domain scripts
+    use ``--db-path`` or ``ERPCLAW_DB_PATH`` when given. If either names a
+    different file, or ``--db-path`` is abbreviated, refuse before anything
+    runs. A PostgreSQL install (``ERPCLAW_DB_DIALECT=postgresql``) names its
+    database through the environment only: any ``--db-path`` or ``--db-url``
+    on the command line is refused, since the router cannot compare a URL
+    with the database the session was given.
+    """
+    if not _READONLY:
+        return
+    if os.environ.get("ERPCLAW_DB_DIALECT", "") == "postgresql":
+        if _argv_db_paths("--db-path") or _argv_db_paths("--db-url"):
+            _readonly_db_mismatch_refusal(
+                None, "ERPCLAW_DB_READONLY=1 on PostgreSQL takes its "
+                      "database from the environment only; --db-path and "
+                      "--db-url are refused.")
+        return
+    here = os.path.abspath(DB_PATH)
+    env_path = os.environ.get("ERPCLAW_DB_PATH", "")
+    if env_path and os.path.abspath(os.path.expanduser(env_path)) != here:
+        _readonly_db_mismatch_refusal("ERPCLAW_DB_PATH")
+    for opt, val in _argv_db_paths():
+        if opt != "--db-path" or not val:
+            _readonly_db_mismatch_refusal("--db-path, spelled in full,")
+        if os.path.abspath(os.path.expanduser(val)) != here:
+            _readonly_db_mismatch_refusal("--db-path")
+
+
+# The MCP credential carve-out (mcp/confirm.py CREDENTIAL_CARVE_OUT), copied
+# here because the router does not import the MCP package. An L0 test keeps
+# the two sets equal.
+_READONLY_CARVE_OUT = frozenset({
+    "backup-database", "list-backups", "verify-backup", "restore-database",
+    "cleanup-backups",
+    "set-credential", "get-credential", "list-credentials", "delete-credential",
+    "migrate-credentials",
+    "import-master-key-from-backup",
+    "add-user", "update-user", "add-role", "assign-role", "revoke-role",
+    "grant-company-membership", "deny-company-membership",
+    "revoke-company-membership",
+    "issue-authorization", "revoke-authorization",
+    "set-password", "seed-permissions",
+    "link-telegram-user", "unlink-telegram-user",
+    "initialize-database",
+})
+
+
+# The read-only session's pinned reads (mcp/confirm.py PINNED_READS), copied
+# here because the router does not import the MCP package. Under read-only
+# storage the router runs no other foundation action, so the router CLI and
+# the MCP door hold the same list. An L0 test keeps the two sets equal.
+_READONLY_PINNED_READS = frozenset({
+    "calculate-revenue-progress",
+    "check-reorder",
+    "sefa-readiness-report",
+    "evaluate-rule",
+    "generate-form941-data",
+    "generate-form940-data",
+    "accounting-adv-status",
+    "ap-aging",
+    "ar-aging",
+    "balance-sheet",
+    "billing-status",
+    "budget-variance",
+    "budget-vs-actual",
+    "buying-status",
+    "cash-flow",
+    "comparative-pl",
+    "dimension-balance-report",
+    "flux-variance-narrative",
+    "general-ledger",
+    "get-account",
+    "get-account-balance",
+    "get-amendment-history",
+    "get-audit-log",
+    "get-audit-checkpoint",
+    "get-best-alternative-for-item",
+    "get-billing-period",
+    "get-billing-run",
+    "get-blanket-order",
+    "get-blanket-po",
+    "get-company",
+    "get-custom-field-values",
+    "get-customer",
+    "get-delivery-note",
+    "get-employee",
+    "get-employee-document",
+    "get-exchange-rate",
+    "get-garnishment",
+    "get-item",
+    "get-item-price",
+    "get-journal-entry",
+    "get-landed-cost-voucher",
+    "get-lease",
+    "get-leave-balance",
+    "get-material-request",
+    "get-meter",
+    "get-outstanding",
+    "get-packing-slip",
+    "get-payment",
+    "get-prepaid-balance",
+    "get-projected-qty",
+    "get-purchase-invoice",
+    "get-purchase-order",
+    "get-purchase-receipt",
+    "get-quotation",
+    "get-rate-plan",
+    "get-recurring-template",
+    "get-revenue-contract",
+    "get-salary-slip",
+    "get-salary-structure",
+    "get-sales-invoice",
+    "get-sales-order",
+    "get-schema-version",
+    "get-stock-balance",
+    "get-stock-entry",
+    "get-stock-revaluation",
+    "get-supplier",
+    "get-tax-template",
+    "get-unallocated-payments",
+    "get-user",
+    "get-withholding-details",
+    "gl-status",
+    "gl-summary",
+    "hr-status",
+    "inventory-demand-forecast",
+    "inventory-status",
+    "journal-month-end-close-preview",
+    "journals-status",
+    "list-account-types",
+    "list-accounts",
+    "list-articles",
+    "list-attendance",
+    "list-batches",
+    "list-billing-periods",
+    "list-billing-runs",
+    "list-blanket-orders",
+    "list-blanket-pos",
+    "list-budgets",
+    "list-companies",
+    "list-company-memberships",
+    "list-consolidation-groups",
+    "list-cost-centers",
+    "list-credit-notes",
+    "list-currencies",
+    "list-custom-fields",
+    "list-customers",
+    "list-delivery-notes",
+    "list-departments",
+    "list-designations",
+    "list-dimensions",
+    "list-dunning-runs",
+    "list-elimination-surplus",
+    "list-employee-bank-accounts",
+    "list-employee-documents",
+    "list-employees",
+    "list-exchange-rates",
+    "list-expense-claims",
+    "list-fiscal-years",
+    "list-garnishments",
+    "list-gl-entries",
+    "list-ic-transactions",
+    "list-intercompany-account-maps",
+    "list-intercompany-invoices",
+    "list-item-alternatives",
+    "list-item-groups",
+    "list-item-suppliers",
+    "list-item-variants",
+    "list-items",
+    "list-journal-entries",
+    "list-landed-cost-vouchers",
+    "list-leases",
+    "list-leave-applications",
+    "list-leave-types",
+    "list-material-requests",
+    "list-meter-readings",
+    "list-meters",
+    "list-open-advances",
+    "list-packing-slips",
+    "list-payment-terms",
+    "list-payments",
+    "list-performance-obligations",
+    "list-purchase-invoices",
+    "list-purchase-orders",
+    "list-purchase-receipts",
+    "list-putaway-rules",
+    "list-quotations",
+    "list-rate-plans",
+    "list-recurring-bill-templates",
+    "list-recurring-invoice-templates",
+    "list-recurring-templates",
+    "list-reservations",
+    "list-revenue-contracts",
+    "consolidation-translation-report",
+    "calculate-benefit-liability",
+    "contract-balance-report",
+    "list-rfqs",
+    "list-roles",
+    "list-salary-assignments",
+    "list-salary-components",
+    "list-salary-slips",
+    "list-salary-structures",
+    "list-sales-invoices",
+    "list-sales-orders",
+    "list-sales-partners",
+    "list-serial-numbers",
+    "list-shift-assignments",
+    "list-shift-types",
+    "list-stock-entries",
+    "list-stock-revaluations",
+    "list-supplier-quotations",
+    "list-suppliers",
+    "list-tax-categories",
+    "list-tax-rules",
+    "list-tax-templates",
+    "list-transfer-price-rules",
+    "list-uoms",
+    "list-users",
+    "list-variable-considerations",
+    "list-voucher-types",
+    "list-warehouses",
+    "multi-dim-trial-balance",
+    "party-ledger",
+    "payment-summary",
+    "payments-status",
+    "payroll-status",
+    "profit-and-loss",
+    "reports-status",
+    "run-follow-up-cycle",
+    "selling-status",
+    "status",
+    "stock-balance",
+    "stock-balance-report",
+    "stock-ledger-report",
+    "standard-cost-variance-report",
+    "tax-status",
+    "tax-summary",
+    "trial-balance",
+    "weekly-digest",
+    "continuous-close-readiness",
+})
+
+def _refuse_readonly_non_read(action):
+    """Under read-only storage, refuse what can change files or state.
+
+    The storage flag only governs database opens. Module management,
+    onboarding, the dangerous set and the credential carve-out can write
+    files (module trees, backups, keys) or need a confirmation a read-only
+    session never gives, so they are refused before any dispatch, by the
+    name called and, for an alias, by its target too. Any other foundation
+    action runs only when the name called (and, for an alias, its target) is
+    a pinned read.
+    """
+    if not _READONLY:
+        return
+    names = {action}
+    if action in ALIASES:
+        names.add(ALIASES[action][1])
+    blocked = (MODULE_ACTIONS | ONBOARDING_ACTIONS | DANGEROUS_ACTIONS
+               | _READONLY_CARVE_OUT)
+    if names & blocked:
+        print(json.dumps({
+            "status": "error",
+            "error": "read_only_session",
+            "action": action,
+            "message": ("This session is read-only; '%s' is module, "
+                        "onboarding, credential or high-impact work, so it "
+                        "was not run." % action),
+        }))
+        sys.exit(1)
+    # A foundation action (tier 1 or 2) runs only when pinned. A name the
+    # router does not map either reaches an installed module (refused by
+    # _refuse_readonly_module_action) or ends as "Unknown action".
+    if ((action in ALIASES or action in ACTION_MAP)
+            and not names <= _READONLY_PINNED_READS):
+        print(json.dumps({
+            "status": "error",
+            "error": "read_only_session",
+            "action": action,
+            "message": ("This session is read-only; '%s' is not on its "
+                        "pinned read list, so it was not run." % action),
+        }))
+        sys.exit(1)
+
+
+def _refuse_readonly_module_action(action, module_name):
+    """Under read-only storage, refuse an installed module's action.
+
+    A module runs its own copy of the lib, which may not honour
+    ERPCLAW_DB_READONLY and could open the database read-write, so no
+    module-routed action starts in a read-only session.
+    """
+    if not _READONLY:
+        return
+    print(json.dumps({
+        "status": "error",
+        "error": "read_only_session",
+        "action": action,
+        "message": ("This session is read-only; '%s' belongs to the "
+                    "installed module '%s', which a read-only session does "
+                    "not run." % (action, module_name)),
+    }))
+    sys.exit(1)
+
+
 def main():
+    _refuse_invalid_actor_context()
+    _refuse_readonly_db_mismatch()
+    _validate_and_normalize_routing_argv()
     action = find_action()
     if not action:
         print(json.dumps({
@@ -1078,6 +1669,9 @@ def main():
             "error": "Missing --action flag. Usage: python3 db_query.py --action <action-name> [flags]"
         }))
         sys.exit(1)
+
+    # Read-only storage refuses non-reads before the confirmation gate.
+    _refuse_readonly_non_read(action)
 
     # Gate dangerous actions BEFORE any dispatch path
     _gate_dangerous_action(action)
@@ -1116,6 +1710,7 @@ def main():
     # Tier 3: Dynamic lookup — check installed modules
     module_name = lookup_module_for_action(action)
     if module_name:
+        _refuse_readonly_module_action(action, module_name)
         _log_action_call(action, module_name, 3)
         forward_module(module_name)
         return

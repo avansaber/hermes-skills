@@ -251,6 +251,55 @@
    "doc_ref": "prov:internal:11819eef",
    "class": "direct"
   },
+  "authority_bootstrap_challenge": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_credential": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_delegation": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_delegation_cap": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_delegation_right": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_delegation_usage": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_deployment": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_install": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_membership": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_principal": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_right": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "authority_session": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+
   "automotiveclaw_buyer_order": {
    "doc_ref": "prov:module-spec:automotiveclaw",
    "class": "module_spec",
@@ -452,6 +501,11 @@
   "compliance_calendar": {
    "doc_ref": "prov:internal:11819eef",
    "class": "direct"
+  },
+  "compliance_exclusion_screening": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   },
   "connv2_booking_connector": {
    "doc_ref": "prov:internal:8820b16c",
@@ -962,6 +1016,11 @@
    "doc_ref": "prov:module-spec:educlaw",
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
+  "educlaw_fee_invoice": {
+   "parent_concept": "educlaw_fee_structure",
+   "doc_ref": "prov:internal:42adb8dc",
+   "class": "child_of_traced"
   },
   "educlaw_fee_structure_item": {
    "doc_ref": "prov:module-spec:educlaw",
@@ -1516,9 +1575,19 @@
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   },
+  "follow_up_threshold": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
   "foodclaw_catering_event": {
    "doc_ref": "prov:internal:16b783f4",
    "class": "direct"
+  },
+  "foodclaw_catering_invoice": {
+   "parent_concept": "foodclaw_catering_event",
+   "doc_ref": "prov:internal:16b783f4",
+   "class": "child_of_traced"
   },
   "foodclaw_catering_item": {
    "doc_ref": "prov:module-spec:foodclaw",
@@ -1631,9 +1700,24 @@
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   },
+  "gl_chain_head": {
+   "parent_concept": "gl_entry",
+   "doc_ref": "prov:architecture",
+   "class": "child_of_traced"
+  },
   "gl_entry": {
    "doc_ref": "prov:architecture",
    "class": "direct"
+  },
+  "healthclaw_340b_accumulation": {
+   "doc_ref": "prov:module-spec:healthclaw",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
+  "healthclaw_340b_idempotency_key": {
+   "parent_concept": "healthclaw_340b_accumulation",
+   "doc_ref": "prov:module-spec:healthclaw",
+   "class": "child_of_traced"
   },
   "healthclaw_aide_assignment": {
    "doc_ref": "prov:internal:31925dbe",
@@ -1684,6 +1768,11 @@
    "class": "direct"
   },
   "healthclaw_care_team": {
+   "doc_ref": "prov:module-spec:healthclaw",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
+  "healthclaw_charity_care_adjustment": {
    "doc_ref": "prov:module-spec:healthclaw",
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
@@ -2015,6 +2104,11 @@
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   },
+  "highered_student_charge": {
+   "doc_ref": "prov:module-spec:educlaw-highered",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
   "holiday": {
    "doc_ref": "prov:internal:0db6995e",
    "class": "direct"
@@ -2129,6 +2223,26 @@
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   },
+  "integration_offline_bank_batch": {
+   "doc_ref": "prov:module-spec:erpclaw-integrations",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
+  "integration_offline_bank_line": {
+   "parent_concept": "integration_offline_bank_batch",
+   "doc_ref": "prov:module-spec:erpclaw-integrations",
+   "class": "child_of_traced"
+  },
+  "integration_quickbooks_batch": {
+   "doc_ref": "prov:module-spec:erpclaw-integrations",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
+  },
+  "integration_quickbooks_line": {
+   "parent_concept": "integration_quickbooks_batch",
+   "doc_ref": "prov:module-spec:erpclaw-integrations",
+   "class": "child_of_traced"
+  },
   "integration_sync": {
    "doc_ref": "prov:internal:cdac60c3",
    "class": "direct"
@@ -2175,6 +2289,11 @@
   "item": {
    "doc_ref": "prov:architecture",
    "class": "direct"
+  },
+  "item_barcode": {
+   "parent_concept": "item",
+   "class": "derived",
+   "note": "Inventory-owned, company-scoped barcode mappings used to resolve reviewed stock drafts"
   },
   "item_alternative": {
    "doc_ref": "prov:internal:736c3aca",
@@ -2476,6 +2595,10 @@
    "doc_ref": "prov:internal:42adb8dc",
    "class": "direct"
   },
+  "nonprofitclaw_endowment_appropriation": {
+   "doc_ref": "prov:internal:f72ccf8f",
+   "class": "direct"
+  },
   "nonprofitclaw_fund": {
    "doc_ref": "prov:internal:f72ccf8f",
    "class": "direct"
@@ -2491,6 +2614,11 @@
   "nonprofitclaw_grant_expense": {
    "doc_ref": "prov:internal:f72ccf8f",
    "class": "direct"
+  },
+  "nonprofitclaw_grant_receipt": {
+   "parent_concept": "nonprofitclaw_grant",
+   "doc_ref": "prov:internal:f72ccf8f",
+   "class": "child_of_traced"
   },
   "nonprofitclaw_pledge": {
    "doc_ref": "prov:internal:f72ccf8f",
@@ -2519,6 +2647,22 @@
   "operation": {
    "doc_ref": "prov:architecture",
    "class": "direct"
+  },
+  "operation_authorization": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "operation_authorization_envelope": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "operation_authorization_issuer": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
+  },
+  "operation_authorization_result": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec"
   },
   "opportunity": {
    "doc_ref": "prov:internal:0698635d",
@@ -3004,6 +3148,11 @@
    "class": "module_spec",
    "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   },
+  "rfq_supplier_request": {
+   "parent_concept": "request_for_quotation",
+   "class": "derived",
+   "note": "Buying-owned, company-scoped unsent supplier message preparations; audit stores only an opaque reference and hash"
+  },
   "risk_assessment": {
    "doc_ref": "prov:internal:11819eef",
    "class": "direct"
@@ -3485,6 +3634,11 @@
   "billing_run_target": {
    "doc_ref": "prov:internal:6392ed16",
    "class": "direct"
+  },
+  "intercompany_account_map": {
+   "doc_ref": "prov:module-spec:erpclaw",
+   "class": "module_spec",
+   "note": "anchored to the owning module's spec (concept-level furniture; finer doc_ref welcome at any refresh)"
   }
  }
 }

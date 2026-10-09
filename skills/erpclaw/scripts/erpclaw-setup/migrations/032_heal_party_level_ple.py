@@ -70,9 +70,8 @@ arithmetic writes nothing when delta is zero, a re-run on a healed install
 appends no PLE row and no audit row: the trail is idempotent for exactly the
 reason the heal is. Read it back with
 
-    get-audit-log --audit-action "migration:032_heal_party_level_ple"
+    get-system-audit-log --audit-action "migration:032_heal_party_level_ple"
 
-Convention + gate: planning/simlogs/m102_SIM_2026-08-12.md.
 """
 import argparse
 import importlib.util
@@ -90,6 +89,7 @@ if importlib.util.find_spec("erpclaw_lib") is None:  # pragma: no cover - env-de
         os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
 
 from erpclaw_lib.audit import migration_action, migration_audit_statement  # noqa: E402
+from erpclaw_lib.payment_clearing import is_customer_refund  # noqa: E402
 
 DEFAULT_DB_PATH = os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "data.sqlite")
 
@@ -180,6 +180,11 @@ def _plan(cur, ph):
             skips.append({"payment_entry_id": pe_id,
                           "reason": "payment carries no party (internal transfer)"})
             continue
+        if is_customer_refund(payment_type, party_type):
+            skips.append({
+                "payment_entry_id": pe_id,
+                "reason": "customer refund: compensation is sign-aware at runtime"})
+            continue
 
         allocated = _sum(cur, ph, _SELECT_LIVE_ALLOC, (pe_id,))
         deducted = _sum(cur, ph, _SELECT_DEDUCTIONS, (pe_id,))
@@ -260,7 +265,7 @@ def _print_summary(writes, skips, report_only):
         print(f"    payment {s['payment_entry_id']}: {s['reason']}")
     if writes and not report_only:
         print(f"  audit trail: {len(writes)} audit_log row(s), committed with the "
-              f"heal. Read them back with:  get-audit-log --audit-action "
+              f"heal. Read them back with:  get-system-audit-log --audit-action "
               f'"{migration_action(MIGRATION_ID)}"')
     elif writes:
         print(f"  report-only: no audit_log row is written — a trail for a change "

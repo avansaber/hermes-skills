@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-GPL--3.0-green" alt="License: GPL-3.0">
   <!-- version badge auto-synced by release/scripts/sync_facts.py (badge URL pattern) -->
-  <img src="https://img.shields.io/badge/version-v4.15.0-0d9488" alt="Version v4.15.0">
+  <img src="https://img.shields.io/badge/version-v4.15.5-0d9488" alt="Version v4.15.5">
   <img src="https://img.shields.io/badge/OpenClaw-skill-14b8a6" alt="OpenClaw Skill">
   <img src="https://img.shields.io/badge/database-SQLite%20%7C%20PostgreSQL-0d9488" alt="SQLite or PostgreSQL">
   <a href="https://www.erpclaw.ai"><img src="https://img.shields.io/badge/website-erpclaw.ai-14b8a6" alt="Website erpclaw.ai"></a>
@@ -151,6 +151,14 @@ domains (`setup`, `gl`, `selling`, `buying`, `inventory`, `billing`, `tax`,
 (`scripts/module_registry.json`) tracks every additional module across the
 `github.com/avansaber/*` repos and installs them on demand by sparse checkout.
 
+Modules in this release install from AvanSaber's signed registry. Contributors
+can build modules and check them with `validate-module` and the constitution
+checks. Customer-accepted publisher signing keys are planned and are not
+supplied by this release. Community modules must obey table ownership, make
+financial changes through actions and follow the installation's
+approval-envelope rules. The planned publisher-key path does not permit direct
+writes to financial tables.
+
 Module authoring and DGM evolution (code generation, sandboxed test runs, the
 deploy pipeline) live in the optional
 [`erpclaw-os-engine`](https://github.com/avansaber/erpclaw-addons/tree/main/erpclaw-os-engine)
@@ -159,9 +167,42 @@ module-generation or auto-deploy code paths.
 
 <sub>Current build:
 <!-- SYNC:facts:start -->
-ERPClaw v4.15.0 | 46 modules (46 active + 0 preview) | 3,235 actions
+ERPClaw v4.15.5 | 46 modules (46 active + 0 preview) | 3,235 actions
 <!-- SYNC:facts:end -->
 </sub>
+
+## What is coming
+
+A short note on where the foundation is heading. No dates, because we would rather ship when the
+checks pass than when a calendar says so.
+
+**More of the business, on the same books.** The ledger, order to cash, source to pay, stock and
+manufacturing, projects and assets, payroll and people, and a growing set of industry editions all
+run on one shared database. We are widening that coverage rather than deepening one corner of it,
+and every new area posts to the same books under the same rules.
+
+**ERPClaw Atrium, our own agent loop.** You can already ask what a customer owes, tell ERPClaw to
+record the payment, and watch it post to the books. Today that conversation runs inside a general
+purpose assistant runtime, which means the experience depends on which runtime you installed and on
+someone else's release schedule. Atrium is our own loop, built so that the conversation is part of
+ERPClaw rather than a property of the software around it. The same behaviour wherever it runs,
+fewer moving parts to install, and the things that need fixing get fixed by us. It is in
+development and not something you can install yet.
+
+**The same rules, whichever door an operation comes through.** Anything the conversation can do goes
+through the same governed operations as everything else. No side door into the database, and no
+second set of accounting rules written for the chat surface. The entry still has to balance, the
+period still has to be open, the posting still lands completely or not at all, and once it is posted
+it still has no edit path.
+
+**Who may approve what.** Identity and authorization are being built out alongside Atrium.
+Approvals route work today. They do not yet require a second approver, and we will not call them a
+control until they are one.
+
+**PostgreSQL past the foundation.** PostgreSQL is already a first class option at the foundation,
+and module coverage is landing one module at a time. We will name each one as it lands.
+
+Watch the releases here for what actually shipped.
 
 ## Web dashboard
 

@@ -6,8 +6,10 @@ Imported by db_query.py (unified router).
 import os
 import sys
 import uuid
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+import json
+import re
+from datetime import date, datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 
 try:
     import importlib.util
@@ -16,6 +18,8 @@ try:
     from erpclaw_lib.naming import get_next_name, ENTITY_PREFIXES
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
+    from erpclaw_lib.query import DecimalSum, P, Q, Table, fn
+    from erpclaw_lib.query_helpers import resolve_company_id, resolve_scope_company
 
     ENTITY_PREFIXES.setdefault("consolidation_group", "CGRP-")
 except ImportError:
@@ -90,10 +94,10 @@ def add_consolidation_group(conn, args):
 # 2. list-consolidation-groups
 # ===========================================================================
 def list_consolidation_groups(conn, args):
+    company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
     where, params = ["1=1"], []
-    if getattr(args, "company_id", None):
-        where.append("company_id = ?")
-        params.append(args.company_id)
+    where.append("company_id = ?")
+    params.append(company_id)
     if getattr(args, "group_status", None):
         where.append("group_status = ?")
         params.append(args.group_status)
@@ -216,7 +220,7 @@ def run_consolidation(conn, args):
 #
 # The unit of "already eliminated" is (group, period, source transaction), which
 # is why the row carries source_ic_transaction_id. Coarser keys were measured and
-# rejected in planning/simlogs/m95_SIM_2026-08-12.md §1: a (group, period) key
+# rejected: a (group, period) key
 # cannot let new activity through, and any key derived from the row's CONTENT
 # collapses two real transactions of the same shape (same from/to/type/amount
 # produces byte-identical rows) and silently under-eliminates.
@@ -403,6 +407,12 @@ def add_currency_translation(conn, args):
     amount = getattr(args, "amount", None)
     if not amount:
         err("--amount is required")
+    try:
+        valid = Decimal(amount).is_finite()
+    except Exception:
+        valid = False
+    if not valid:
+        err(f"Invalid amount: {amount}")
 
     debit_account = getattr(args, "debit_account", None) or "CTA - Debit"
     credit_account = getattr(args, "credit_account", None) or "CTA - Credit"
@@ -511,11 +521,29 @@ def consolidation_summary(conn, args):
         (group_id,)
     ).fetchone()[0]
 
-    by_type = conn.execute("""
-        SELECT entry_type, COUNT(*) as cnt, SUM(CAST(amount AS NUMERIC)) as total
-        FROM advacct_elimination_entry WHERE group_id = ?
-        GROUP BY entry_type
-    """, (group_id,)).fetchall()
+    _elim_t = Table("advacct_elimination_entry")
+    _by_type_q = (
+        Q.from_(_elim_t)
+        .select(
+            _elim_t.entry_type,
+            fn.Count("*").as_("cnt"),
+            fn.Coalesce(DecimalSum(_elim_t.amount), "0").as_("total"),
+        )
+        .where(_elim_t.group_id == P())
+        .groupby(_elim_t.entry_type)
+    )
+    by_type = conn.execute(_by_type_q.get_sql(), (group_id,)).fetchall()
+
+    _by_type_out = {}
+    for _row in by_type:
+        _data = row_to_dict(_row)
+        _raw = _data.get("total")
+        if _raw is None:
+            _raw = "0"
+        _by_type_out[_data["entry_type"]] = {
+            "count": _data["cnt"],
+            "total": str(Decimal(str(_raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+        }
 
     ok({
         "report": "consolidation_summary",
@@ -525,7 +553,7 @@ def consolidation_summary(conn, args):
         "consolidation_currency": group["consolidation_currency"],
         "entity_count": entity_count,
         "elimination_count": elimination_count,
-        "eliminations_by_type": {r[0]: {"count": r[1], "total": str(Decimal(str(r[2])).quantize(Decimal("0.01")))} for r in by_type} if by_type else {},
+        "eliminations_by_type": _by_type_out,
     })
 
 
@@ -550,9 +578,6 @@ def consolidation_summary(conn, args):
 # fully audited removal is the consented opposite. These rows live in the
 # consolidation layer only (init_schema's own note: group elimination never
 # reaches `gl_entry`), so the immutable-GL rules are untouched.
-#
-# Plan home: planning/pending_items.md M114 (Nik go 2026-08-14);
-# SIM: planning/simlogs/m114_SIM_2026-08-14.md.
 # ===========================================================================
 
 _SURPLUS_WHERE = ("entry_type = 'ic_elimination' "
@@ -671,9 +696,166 @@ def remove_elimination_surplus(conn, args):
 
 
 # ---------------------------------------------------------------------------
+# Explicit-rate translation worksheet
+# ---------------------------------------------------------------------------
+def _translation_decimal(value, label, rate=False, signed=False):
+    pattern = r"(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,12})?" if rate else (
+        r"-?(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,2})?" if signed else
+        r"(?:0|[1-9][0-9]{0,17})(?:\.[0-9]{1,2})?")
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+        err(f"Invalid {label}: use a canonical decimal string")
+    result = Decimal(value)
+    if rate and result <= 0:
+        err(f"{label} must be greater than zero")
+    return result
+
+
+def consolidation_translation_report(conn, args):
+    """Translate one entity's base-currency trial balance without posting.
+
+    The operator supplies rate policy and carried reporting equity. No accounting
+    eligibility, currency remeasurement or retained-earnings history is inferred.
+    """
+    company_id = getattr(args, "company_id", None)
+    entity_id = getattr(args, "entity_company_id", None)
+    from erpclaw_lib import actor, company_scope
+    try:
+        allowed = company_scope.resolution_scope(conn, actor.current())
+    except company_scope.ScopeRefused:
+        err(company_scope.REFUSAL_CODE)
+    if allowed is not None and (company_id not in allowed or entity_id not in allowed):
+        err(company_scope.REFUSAL_CODE)
+    group_t, entity_t, company_t = (Table(name) for name in (
+        "advacct_consolidation_group", "advacct_group_entity", "company"))
+    group_row = conn.execute(Q.from_(group_t).select("*").where(
+        (group_t.id == P()) & (group_t.company_id == P())).get_sql(),
+        (getattr(args, "group_id", None), company_id)).fetchone()
+    entity_rows = conn.execute(Q.from_(entity_t).select("*").where(
+        (entity_t.group_id == P()) & (entity_t.entity_company_id == P()) &
+        (entity_t.company_id == P()) & (entity_t.is_active == 1)).get_sql(),
+        (getattr(args, "group_id", None), entity_id, company_id)).fetchall()
+    functional = conn.execute(Q.from_(company_t).select(company_t.default_currency).where(
+        company_t.id == P()).get_sql(), (entity_id,)).fetchone()
+    if not group_row or group_row["group_status"] != "active" or len(entity_rows) != 1 or not functional:
+        err("An active owned consolidation group and exactly one active company entity are required")
+    entity = entity_rows[0]
+    if entity["consolidation_method"] != "full" or entity["functional_currency"] != functional[0]:
+        err("This report requires full consolidation and functional currency matching the entity's base currency")
+    if group_row["consolidation_currency"] == functional[0]:
+        err("The reporting currency must differ from the entity's functional currency")
+    dates = []
+    for field in ("start_date", "period_date"):
+        text = getattr(args, field, None)
+        try:
+            parsed = date.fromisoformat(text)
+        except (TypeError, ValueError):
+            err(f"{field.replace('_', '-')} must be YYYY-MM-DD")
+        if parsed.isoformat() != text:
+            err(f"{field.replace('_', '-')} must be YYYY-MM-DD")
+        dates.append(text)
+    start, end = dates
+    if start > end:
+        err("start-date cannot follow period-date")
+    reference = getattr(args, "review_reference", None)
+    if not isinstance(reference, str) or not reference.strip() or len(reference) > 200:
+        err("review-reference is required and must be at most 200 characters")
+    closing = _translation_decimal(getattr(args, "closing_rate", None), "closing-rate", rate=True)
+    average = _translation_decimal(getattr(args, "average_rate", None), "average-rate", rate=True)
+    raw = getattr(args, "translation_policy", None)
+    if not isinstance(raw, str) or len(raw) > 1000000:
+        err("translation-policy must be a JSON array")
+    try:
+        policy = json.loads(raw)
+    except ValueError:
+        err("translation-policy must be a JSON array")
+    if not isinstance(policy, list) or not policy or len(policy) > 5000:
+        err("translation-policy must contain between one and 5000 account policies")
+    accounts_t, gl = Table("account"), Table("gl_entry")
+    accounts = {row["id"]: row_to_dict(row) for row in conn.execute(
+        Q.from_(accounts_t).select("*").where(accounts_t.company_id == P()).get_sql(), (entity_id,)).fetchall()}
+    ledger = conn.execute(Q.from_(gl).join(accounts_t).on(gl.account_id == accounts_t.id).select(
+        gl.account_id, gl.posting_date, gl.debit_base, gl.credit_base).where(
+        (accounts_t.company_id == P()) & (gl.posting_date <= P()) & (gl.is_cancelled == 0)).get_sql(),
+        (entity_id, end)).fetchall()
+    if not ledger:
+        err("The entity has no active ledger rows through period-date")
+    with localcontext() as context:
+        context.prec = 60
+        balances, opening_income = {}, {}
+        for row in ledger:
+            debit = _translation_decimal(row["debit_base"], "ledger debit_base")
+            credit = _translation_decimal(row["credit_base"], "ledger credit_base")
+            account_id = row["account_id"]
+            balances[account_id] = balances.get(account_id, Decimal("0")) + debit - credit
+            if row["posting_date"] < start and accounts[account_id]["root_type"] in ("income", "expense"):
+                opening_income[account_id] = opening_income.get(account_id, Decimal("0")) + debit - credit
+        if any(opening_income.values()):
+            err("Income and expense opening balances must be closed before start-date")
+        if sum(balances.values(), Decimal("0")) != 0:
+            err("The entity's active base-currency trial balance is not balanced")
+        seen, rows = set(), []
+        translated_net, exact_net = Decimal("0"), Decimal("0")
+        for item in policy:
+            if not isinstance(item, dict):
+                err("Every translation policy must be an object")
+            account_id, basis = item.get("account_id"), item.get("basis")
+            if not isinstance(account_id, str) or account_id in seen or account_id not in accounts:
+                err("Each policy must name a distinct account belonging to the entity")
+            seen.add(account_id)
+            account = accounts[account_id]
+            if account["is_group"] or account["currency"] != functional[0]:
+                err("Each policy account must be a leaf in the entity's functional currency")
+            root, source = account["root_type"], balances.get(account_id, Decimal("0"))
+            fields = {"account_id", "basis"}
+            rate = None
+            if root in ("asset", "liability") and basis == "closing":
+                rate = closing
+            elif root in ("income", "expense") and basis == "average":
+                rate = average
+            elif root == "equity" and basis == "historical" and item.get("equity_class") == "capital":
+                fields |= {"rate", "equity_class"}
+                rate = _translation_decimal(item.get("rate"), "historical rate", rate=True)
+            elif root == "equity" and basis == "carry" and item.get("equity_class") in ("retained-earnings", "other-equity"):
+                fields |= {"reporting_balance", "equity_class"}
+            else:
+                err("Policy basis must match the account root; retained earnings and other equity require carried reporting balances")
+            if set(item) != fields:
+                err("Translation policy fields do not match its basis")
+            if source == 0 and basis != "carry":
+                err("Zero-balance policies are allowed only for carried equity")
+            exact = source * rate if rate is not None else _translation_decimal(
+                item.get("reporting_balance"), "carried reporting_balance", signed=True)
+            translated = exact.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            exact_net += exact
+            translated_net += translated
+            rows.append({"account_id": account_id, "account_name": account["name"], "root_type": root,
+                         "basis": basis, "source_balance": f"{source:.2f}", "translated_balance": f"{translated:.2f}",
+                         "rate": str(rate) if rate is not None else None, "equity_class": item.get("equity_class")})
+        if {key for key, value in balances.items() if value != 0} - seen:
+            err("translation-policy must cover every nonzero account in the active trial balance")
+        debits = sum((Decimal(row["translated_balance"]) for row in rows if Decimal(row["translated_balance"]) > 0), Decimal("0"))
+        credits = sum((-Decimal(row["translated_balance"]) for row in rows if Decimal(row["translated_balance"]) < 0), Decimal("0"))
+        cta = -translated_net if translated_net else Decimal("0")
+        ok({"report": "consolidation_translation", "group_id": group_row["id"], "company_id": company_id,
+            "entity_company_id": entity_id, "start_date": start, "period_date": end,
+            "functional_currency": functional[0], "reporting_currency": group_row["consolidation_currency"],
+            "rate_convention": "reporting currency units per functional currency unit", "closing_rate": str(closing),
+            "average_rate": str(average), "review_reference": reference.strip(), "rows": rows,
+            "translated_debits_before_cta": f"{debits:.2f}", "translated_credits_before_cta": f"{credits:.2f}",
+            "balancing_cta_debit": f"{max(cta, Decimal('0')):.2f}",
+            "balancing_cta_credit": f"{max(-cta, Decimal('0')):.2f}",
+            "balancing_cta_balance": f"{cta:.2f}", "rounding_difference": str(translated_net - exact_net),
+            "balanced_debits": f"{debits + max(cta, Decimal('0')):.2f}",
+            "balanced_credits": f"{credits + max(-cta, Decimal('0')):.2f}",
+            "posted": False, "stored": False, "result_kind": "translation_preview",
+            "scope": "One full-consolidation entity, operator-approved rates and carried equity. No remeasurement, ownership allocation, tax, eliminations, CTA rollforward, compliance certification or ledger posting."})
+
+
+# ---------------------------------------------------------------------------
 # Action registry
 # ---------------------------------------------------------------------------
 ACTIONS = {
+    "consolidation-translation-report": consolidation_translation_report,
     "add-consolidation-group": add_consolidation_group,
     "list-consolidation-groups": list_consolidation_groups,
     "add-group-entity": add_group_entity,

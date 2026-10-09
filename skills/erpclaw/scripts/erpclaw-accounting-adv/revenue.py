@@ -5,10 +5,11 @@ and revenue schedules (4 tables, 14 actions).
 Imported by db_query.py (unified router).
 """
 import os
+import re
 import sys
 import uuid
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import date, datetime, timezone
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, localcontext
 
 try:
     import importlib.util
@@ -17,7 +18,9 @@ try:
     from erpclaw_lib.naming import get_next_name, ENTITY_PREFIXES
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
-    from erpclaw_lib.query import dynamic_update
+    from erpclaw_lib.query import Case, DecimalSum, Field, P, Q, Table, dynamic_update, fn, update_row
+    from erpclaw_lib.query_helpers import resolve_company_id, resolve_scope_company
+    from erpclaw_lib.gl_posting import insert_gl_entries
 
     ENTITY_PREFIXES.setdefault("revenue_contract", "RCON-")
 except ImportError:
@@ -25,7 +28,13 @@ except ImportError:
 
 SKILL = "erpclaw-accounting-adv"
 
+RECOGNITION_VOUCHER_TYPE = "revenue_recognition"
+
 _now_iso = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _today_utc():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -47,6 +56,102 @@ def _validate_company(conn, company_id):
         err(f"Company {company_id} not found")
 
 
+def _money(raw):
+    """Parse a money amount: finite, non-negative sign unchecked, at most 2dp.
+
+    Returns the Decimal when raw parses, is finite, and carries an exponent
+    between -2 and 0 inclusive. Otherwise returns None. Callers check the
+    sign. ``is_finite`` is tested before reading the exponent because NaN
+    and Infinity carry a non-integer exponent that cannot be compared.
+    """
+    try:
+        amount = Decimal(raw)
+    except Exception:
+        return None
+    if not amount.is_finite():
+        return None
+    exponent = amount.as_tuple().exponent
+    if not isinstance(exponent, int) or exponent < -2 or exponent > 0:
+        return None
+    return amount
+
+
+def _recognition_accounts(conn, args, company_id):
+    """Resolve the ledger accounts a recognition posting needs, before any write."""
+    deferred_id = getattr(args, "deferred_revenue_account_id", None)
+    revenue_id = getattr(args, "revenue_account_id", None)
+    cost_center_id = getattr(args, "cost_center_id", None)
+    currency = getattr(args, "currency", None) or "USD"
+    if not deferred_id or not revenue_id:
+        err("--deferred-revenue-account-id and --revenue-account-id are required: "
+            "recognizing revenue posts DR deferred revenue / CR revenue")
+    acct_t = Table("account")
+    deferred_row = conn.execute(
+        Q.from_(acct_t).select(acct_t.star)
+        .where(acct_t.id == P()).where(acct_t.company_id == P()).get_sql(),
+        (deferred_id, company_id)).fetchone()
+    if deferred_row is None:
+        err(f"Account {deferred_id} not found in company {company_id}")
+    revenue_row = conn.execute(
+        Q.from_(acct_t).select(acct_t.star)
+        .where(acct_t.id == P()).where(acct_t.company_id == P()).get_sql(),
+        (revenue_id, company_id)).fetchone()
+    if revenue_row is None:
+        err(f"Account {revenue_id} not found in company {company_id}")
+    deferred = row_to_dict(deferred_row)
+    revenue = row_to_dict(revenue_row)
+    if deferred.get("root_type") != "liability":
+        err(f"Deferred revenue account {deferred_id} must be a liability account, "
+            f"not {deferred.get('root_type')}")
+    if revenue.get("root_type") != "income":
+        err(f"Revenue account {revenue_id} must be an income account, "
+            f"not {revenue.get('root_type')}")
+    return {
+        "deferred_revenue_account_id": deferred_id,
+        "revenue_account_id": revenue_id,
+        "cost_center_id": cost_center_id,
+        "currency": currency,
+    }
+
+
+def _post_recognition(conn, entry, accts):
+    """Post DR deferred / CR revenue for one schedule entry and flag it.
+
+    Runs inside the caller's transaction and never commits: either the
+    ledger voucher and the recognized flag land together or neither does.
+    Returns the new gl_entry ids.
+    """
+    raw = entry["amount"]
+    amount = _money(raw)
+    if amount is None or amount <= 0:
+        raise ValueError(
+            f"Revenue schedule entry {entry['id']} has amount {raw}; "
+            "only a positive two-decimal amount can be recognized")
+    currency = accts["currency"]
+    legs = [
+        {"account_id": accts["deferred_revenue_account_id"],
+         "debit": str(amount), "credit": "0",
+         "currency": currency, "exchange_rate": "1"},
+        {"account_id": accts["revenue_account_id"],
+         "debit": "0", "credit": str(amount),
+         "cost_center_id": accts["cost_center_id"],
+         "currency": currency, "exchange_rate": "1"},
+    ]
+    gl_ids = insert_gl_entries(
+        conn, legs,
+        voucher_type=RECOGNITION_VOUCHER_TYPE, voucher_id=entry["id"],
+        posting_date=entry["period_date"], company_id=entry["company_id"],
+        remarks=f"Revenue recognition {entry['period_date']}")
+    flag_sql = update_row(
+        "advacct_revenue_schedule",
+        data={"recognized": 1}, where={"id": P(), "recognized": 0})
+    cursor = conn.execute(flag_sql, (entry["id"],))
+    if cursor.rowcount != 1:
+        raise ValueError(
+            f"Revenue schedule entry {entry['id']} is already recognized")
+    return gl_ids
+
+
 def _validate_contract(conn, contract_id):
     if not contract_id:
         err("--contract-id is required")
@@ -65,10 +170,8 @@ def add_revenue_contract(conn, args):
         err("--customer-name is required")
 
     total_value = getattr(args, "total_value", None) or "0"
-    # Validate it's a valid decimal
-    try:
-        Decimal(total_value)
-    except Exception:
+    parsed_total_value = _money(total_value)
+    if parsed_total_value is None or parsed_total_value < 0:
         err(f"Invalid total-value: {total_value}")
 
     contract_id = str(uuid.uuid4())
@@ -109,6 +212,11 @@ def update_revenue_contract(conn, args):
         err("--id is required")
     if not conn.execute("SELECT id FROM advacct_revenue_contract WHERE id = ?", (contract_id,)).fetchone():
         err(f"Revenue contract {contract_id} not found")
+    total_value = getattr(args, "total_value", None)
+    if total_value is not None:
+        parsed_total_value = _money(total_value)
+        if parsed_total_value is None or parsed_total_value < 0:
+            err(f"Invalid total-value: {total_value}")
 
     data, changed = {}, []
     for arg_name, col_name in {
@@ -133,11 +241,15 @@ def update_revenue_contract(conn, args):
     if not data:
         err("No fields to update")
 
+    current = row_to_dict(conn.execute(
+        "SELECT * FROM advacct_revenue_contract WHERE id = ?", (contract_id,)).fetchone())
+    old_values = {col: current[col] for col in changed}
     data["updated_at"] = _now_iso()
     sql, params = dynamic_update("advacct_revenue_contract", data, where={"id": contract_id})
     conn.execute(sql, params)
+    new_values = {col: data[col] for col in changed}
     audit(conn, SKILL, "update-revenue-contract", "advacct_revenue_contract", contract_id,
-          new_values={"updated_fields": changed})
+          old_values=old_values, new_values=new_values)
     conn.commit()
     ok({"id": contract_id, "updated_fields": changed})
 
@@ -176,10 +288,10 @@ def get_revenue_contract(conn, args):
 # 4. list-revenue-contracts
 # ===========================================================================
 def list_revenue_contracts(conn, args):
+    company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
     where, params = ["1=1"], []
-    if getattr(args, "company_id", None):
-        where.append("company_id = ?")
-        params.append(args.company_id)
+    where.append("company_id = ?")
+    params.append(company_id)
     if getattr(args, "contract_status", None):
         where.append("contract_status = ?")
         params.append(args.contract_status)
@@ -224,6 +336,10 @@ def add_performance_obligation(conn, args):
     if recognition_basis not in VALID_RECOGNITION_BASES:
         err(f"Invalid recognition-basis: {recognition_basis}. Must be one of: {', '.join(VALID_RECOGNITION_BASES)}")
 
+    parsed_standalone_price = _money(standalone_price)
+    if parsed_standalone_price is None or parsed_standalone_price < 0:
+        err(f"Invalid standalone-price: {standalone_price}")
+
     obligation_id = str(uuid.uuid4())
     now = _now_iso()
 
@@ -243,13 +359,18 @@ def add_performance_obligation(conn, args):
     ))
 
     # Update contract allocated_value
-    total_allocated = conn.execute(
-        "SELECT COALESCE(SUM(CAST(allocated_price AS NUMERIC)), 0) FROM advacct_performance_obligation WHERE contract_id = ?",
-        (contract_id,)
-    ).fetchone()[0]
+    _ob_t = Table("advacct_performance_obligation")
+    _alloc_q = (
+        Q.from_(_ob_t)
+        .select(fn.Coalesce(DecimalSum(_ob_t.allocated_price), "0").as_("total"))
+        .where(_ob_t.contract_id == P())
+    )
+    _alloc_row = conn.execute(_alloc_q.get_sql(), (contract_id,)).fetchone()
+    _alloc_raw = _alloc_row["total"] if _alloc_row["total"] is not None else "0"
+    total_allocated = str(Decimal(str(_alloc_raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
     conn.execute(
         "UPDATE advacct_revenue_contract SET allocated_value = ?, updated_at = ? WHERE id = ?",
-        (str(Decimal(str(total_allocated)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), _now_iso(), contract_id)
+        (total_allocated, _now_iso(), contract_id)
     )
 
     audit(conn, SKILL, "add-performance-obligation", "advacct_performance_obligation", obligation_id,
@@ -266,13 +387,17 @@ def add_performance_obligation(conn, args):
 # 6. list-performance-obligations
 # ===========================================================================
 def list_performance_obligations(conn, args):
+    if not (getattr(args, "contract_id", None) and not getattr(args, "company_id", None) and not getattr(args, "company_name", None)):
+        company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
+    else:
+        company_id = None
     where, params = ["1=1"], []
     if getattr(args, "contract_id", None):
         where.append("contract_id = ?")
         params.append(args.contract_id)
-    if getattr(args, "company_id", None):
+    if company_id is not None:
         where.append("company_id = ?")
-        params.append(args.company_id)
+        params.append(company_id)
     if getattr(args, "obligation_status", None):
         where.append("obligation_status = ?")
         params.append(args.obligation_status)
@@ -312,6 +437,9 @@ def satisfy_performance_obligation(conn, args):
     try:
         pct = Decimal(pct_complete)
     except Exception:
+        err(f"Invalid pct-complete: {pct_complete}")
+
+    if not pct.is_finite():
         err(f"Invalid pct-complete: {pct_complete}")
 
     if pct < Decimal("0") or pct > Decimal("100"):
@@ -360,6 +488,21 @@ def add_variable_consideration(conn, args):
 
     probability = getattr(args, "probability", None) or "0"
 
+    parsed_estimated_amount = _money(estimated_amount)
+    if parsed_estimated_amount is None or parsed_estimated_amount < 0:
+        err(f"Invalid estimated-amount: {estimated_amount}")
+    parsed_constraint_amount = _money(constraint_amount)
+    if parsed_constraint_amount is None or parsed_constraint_amount < 0:
+        err(f"Invalid constraint-amount: {constraint_amount}")
+    try:
+        parsed_probability = Decimal(probability)
+    except Exception:
+        err(f"Invalid probability: {probability}")
+    if (not parsed_probability.is_finite()
+            or parsed_probability < Decimal("0")
+            or parsed_probability > Decimal("100")):
+        err(f"Invalid probability: {probability}")
+
     vc_id = str(uuid.uuid4())
     now = _now_iso()
 
@@ -385,13 +528,17 @@ def add_variable_consideration(conn, args):
 # 9. list-variable-considerations
 # ===========================================================================
 def list_variable_considerations(conn, args):
+    if not (getattr(args, "contract_id", None) and not getattr(args, "company_id", None) and not getattr(args, "company_name", None)):
+        company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
+    else:
+        company_id = None
     where, params = ["1=1"], []
     if getattr(args, "contract_id", None):
         where.append("contract_id = ?")
         params.append(args.contract_id)
-    if getattr(args, "company_id", None):
+    if company_id is not None:
         where.append("company_id = ?")
-        params.append(args.company_id)
+        params.append(company_id)
 
     where_sql = " AND ".join(where)
     total = conn.execute(
@@ -441,6 +588,84 @@ def modify_contract(conn, args):
 # ===========================================================================
 # 11. calculate-revenue-schedule
 # ===========================================================================
+def calculate_revenue_progress(conn, args):
+    """Calculate an operator's cumulative progress estimate without posting."""
+    company_id = getattr(args, "company_id", None)
+    _validate_company(conn, company_id)
+    obligation_id = getattr(args, "obligation_id", None)
+    if not obligation_id:
+        err("--obligation-id is required")
+    obligations = Table("advacct_performance_obligation")
+    contracts = Table("advacct_revenue_contract")
+    query = (Q.from_(obligations).join(contracts)
+             .on(contracts.id == obligations.contract_id)
+             .select(obligations.star)
+             .where(obligations.id == P())
+             .where(obligations.company_id == P())
+             .where(contracts.company_id == P()))
+    row = conn.execute(query.get_sql(),
+                       (obligation_id, company_id, company_id)).fetchone()
+    if row is None:
+        err("Performance obligation and contract must belong to the selected company")
+    obligation = row_to_dict(row)
+    if obligation["recognition_method"] != "over_time":
+        err("Progress calculation requires an over_time performance obligation")
+    basis = obligation["recognition_basis"]
+    if basis not in ("input", "output"):
+        err("Progress calculation requires an input or output recognition basis; "
+            "the existing time-based schedule is unchanged")
+    price = _money(obligation["allocated_price"])
+    prior = _money(getattr(args, "recognized_to_date", None))
+    if price is None or price < 0:
+        err("The performance obligation has an invalid allocated price")
+    if prior is None or prior < 0 or prior > price:
+        err("--recognized-to-date must be a non-negative two-decimal amount "
+            "no greater than the allocated price")
+
+    names = (("costs_incurred", "estimated_total_costs") if basis == "input"
+             else ("completed_units", "total_units"))
+    unused = (("completed_units", "total_units") if basis == "input"
+              else ("costs_incurred", "estimated_total_costs"))
+    if any(getattr(args, name, None) is not None for name in unused):
+        err(f"Use only the progress inputs for the stored {basis} recognition basis")
+    values = []
+    for name in names:
+        raw = getattr(args, name, None)
+        if basis == "input":
+            value = _money(raw)
+        elif isinstance(raw, str) and re.fullmatch(r"[0-9]+(?:\.[0-9]{1,6})?", raw):
+            value = Decimal(raw)
+        else:
+            value = None
+        if value is None or value < 0:
+            err(f"--{name.replace('_', '-')} must be a non-negative "
+                + ("two-decimal amount" if basis == "input" else "quantity with at most six decimals"))
+        values.append(value)
+    completed, total = values
+    if total <= 0:
+        err(f"--{names[1].replace('_', '-')} must be greater than zero")
+    if basis == "output" and completed > total:
+        err("--completed-units cannot exceed --total-units")
+    with localcontext() as context:
+        context.prec = max(50, sum(len(value.as_tuple().digits)
+                                  for value in (price, completed, total)) + 10)
+        fraction = min(Decimal("1"), completed / total)
+        target = (price * fraction).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        catch_up = (target - prior).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        percentage = (fraction * 100).quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    ok({"obligation_id": obligation_id, "company_id": company_id,
+        "recognition_basis": basis, "result_kind": "calculation_only", "posted": False,
+        "progress_inputs": {name: str(value) for name, value in zip(names, values)},
+        "progress_percent": str(percentage), "allocated_price": str(price.quantize(Decimal("0.01"))),
+        "operator_recognized_to_date": str(prior.quantize(Decimal("0.01"))),
+        "cumulative_revenue_target": str(target), "current_period_catch_up": str(catch_up),
+        "remaining_allocated_revenue": str(price - target),
+        "input_cost_overrun": basis == "input" and completed > total,
+        "review_required": "Operator confirms over-time eligibility, allocation, eligible costs "
+                           "or output units, and prior recognized revenue. Negative catch-up needs "
+                           "a reviewed reversal; this calculation creates no schedule or ledger entry."})
+
+
 def calculate_revenue_schedule(conn, args):
     ob_id = getattr(args, "obligation_id", None)
     if not ob_id:
@@ -527,34 +752,88 @@ def generate_revenue_entries(conn, args):
     if not row:
         err(f"Performance obligation {ob_id} not found")
 
-    # Get unrecognized schedule entries
-    schedules = conn.execute(
-        "SELECT * FROM advacct_revenue_schedule WHERE obligation_id = ? AND recognized = 0 ORDER BY period_date",
-        (ob_id,)
-    ).fetchall()
+    today = _today_utc()
+    raw_as_of = getattr(args, "as_of_date", None)
+    as_of = raw_as_of if raw_as_of else today
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", as_of):
+        err("--as-of-date must be a date in YYYY-MM-DD form")
+    try:
+        datetime.strptime(as_of, "%Y-%m-%d")
+    except ValueError:
+        err("--as-of-date must be a date in YYYY-MM-DD form")
+    if raw_as_of and as_of > today:
+        err(f"--as-of-date {as_of} is later than today ({today}); "
+            "revenue for a period that has not arrived is not recognized")
 
-    if not schedules:
-        err("No unrecognized revenue schedule entries found")
+    # Get the unrecognized schedule entries due on or before the as-of date.
+    # period_date is stored as YYYY-MM-DD text, so the comparison is a
+    # string comparison, as the existing ORDER BY already relies on.
+    sched_t = Table("advacct_revenue_schedule")
+    due_rows = conn.execute(
+        (Q.from_(sched_t).select(sched_t.star)
+         .where(sched_t.obligation_id == P())
+         .where(sched_t.recognized == 0)
+         .where(sched_t.period_date <= P())
+         .orderby(sched_t.period_date)
+         .orderby(sched_t.id)).get_sql(),
+        (ob_id, as_of)).fetchall()
+
+    if not due_rows:
+        earliest_rows = conn.execute(
+            (Q.from_(sched_t).select(sched_t.star)
+             .where(sched_t.obligation_id == P())
+             .where(sched_t.recognized == 0)
+             .orderby(sched_t.period_date)
+             .orderby(sched_t.id)).get_sql(),
+            (ob_id,)).fetchall()
+        if not earliest_rows:
+            err("No unrecognized revenue schedule entries found")
+        next_date = row_to_dict(earliest_rows[0])["period_date"]
+        err(f"No revenue schedule entries for obligation {ob_id} are due on or before {as_of}; "
+            f"the next is {next_date}")
+
+    obligation = row_to_dict(row)
+    accts = _recognition_accounts(conn, args, obligation["company_id"])
+
+    entries = [row_to_dict(sched) for sched in due_rows]
+    for entry in entries:
+        if _money(entry["amount"]) is None or _money(entry["amount"]) <= 0:
+            err(f"Revenue for obligation {ob_id} was not recognized: "
+                f"schedule entry {entry['id']} has amount {entry['amount']}; "
+                "only a positive two-decimal amount can be recognized")
 
     recognized_count = 0
     total_recognized = Decimal("0")
+    gl_entry_count = 0
 
-    for sched in schedules:
-        s = row_to_dict(sched)
-        conn.execute(
-            "UPDATE advacct_revenue_schedule SET recognized = 1 WHERE id = ?",
-            (s["id"],)
-        )
+    for entry in entries:
+        try:
+            gl_ids = _post_recognition(conn, entry, accts)
+        except (ValueError, NotImplementedError) as exc:
+            conn.rollback()
+            err(f"Revenue for obligation {ob_id} was not recognized: "
+                f"the ledger posting for schedule entry {entry['id']} was refused: {exc}")
         recognized_count += 1
-        total_recognized += Decimal(s["amount"])
+        total_recognized += _money(entry["amount"])
+        gl_entry_count += len(gl_ids)
+
+    remaining_count = int(conn.execute(
+        (Q.from_(sched_t).select(fn.Count("*").as_("remaining"))
+         .where(sched_t.obligation_id == P())
+         .where(sched_t.recognized == 0)).get_sql(),
+        (ob_id,)).fetchone()[0])
 
     audit(conn, SKILL, "generate-revenue-entries", "advacct_revenue_schedule", ob_id,
-          new_values={"recognized_count": recognized_count, "total_recognized": str(total_recognized)})
+          new_values={"recognized_count": recognized_count, "total_recognized": str(total_recognized),
+                      "as_of_date": as_of})
     conn.commit()
     ok({
         "obligation_id": ob_id,
         "recognized_count": recognized_count,
         "total_recognized": str(total_recognized),
+        "gl_entry_count": gl_entry_count,
+        "as_of_date": as_of,
+        "remaining_count": remaining_count,
     })
 
 
@@ -562,10 +841,10 @@ def generate_revenue_entries(conn, args):
 # 13. revenue-waterfall-report
 # ===========================================================================
 def revenue_waterfall_report(conn, args):
+    company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
     where, params = ["1=1"], []
-    if getattr(args, "company_id", None):
-        where.append("c.company_id = ?")
-        params.append(args.company_id)
+    where.append("c.company_id = ?")
+    params.append(company_id)
 
     where_sql = " AND ".join(where)
     rows = conn.execute(f"""
@@ -591,28 +870,41 @@ def revenue_waterfall_report(conn, args):
 # 14. revenue-recognition-summary
 # ===========================================================================
 def revenue_recognition_summary(conn, args):
-    where, params = ["1=1"], []
-    if getattr(args, "company_id", None):
-        where.append("rs.company_id = ?")
-        params.append(args.company_id)
+    sched_t = Table("advacct_revenue_schedule").as_("rs")
+    company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
+    recognized_case = Case().when(sched_t.recognized == 1, sched_t.amount).else_("0")
+    unrecognized_case = Case().when(sched_t.recognized == 0, sched_t.amount).else_("0")
+    query = (
+        Q.from_(sched_t)
+        .select(
+            sched_t.period_date,
+            fn.Coalesce(DecimalSum(sched_t.amount), "0").as_("total_amount"),
+            fn.Coalesce(DecimalSum(recognized_case), "0").as_("recognized_amount"),
+            fn.Coalesce(DecimalSum(unrecognized_case), "0").as_("unrecognized_amount"),
+            fn.Count("*").as_("entry_count"),
+        )
+        .groupby(sched_t.period_date)
+        .orderby(sched_t.period_date)
+    )
+    params = []
+    query = query.where(sched_t.company_id == P())
+    params.append(company_id)
+    rows = conn.execute(query.get_sql(), params).fetchall()
 
-    where_sql = " AND ".join(where)
-    rows = conn.execute(f"""
-        SELECT rs.period_date,
-               SUM(CAST(rs.amount AS NUMERIC)) as total_amount,
-               SUM(CASE WHEN rs.recognized = 1 THEN CAST(rs.amount AS NUMERIC) ELSE 0 END) as recognized_amount,
-               SUM(CASE WHEN rs.recognized = 0 THEN CAST(rs.amount AS NUMERIC) ELSE 0 END) as unrecognized_amount,
-               COUNT(*) as entry_count
-        FROM advacct_revenue_schedule rs
-        WHERE {where_sql}
-        GROUP BY rs.period_date
-        ORDER BY rs.period_date
-    """, params).fetchall()
+    out = []
+    for item in rows:
+        data = row_to_dict(item)
+        for key in ("total_amount", "recognized_amount", "unrecognized_amount"):
+            raw = data.get(key)
+            if raw is None:
+                raw = "0"
+            data[key] = str(Decimal(str(raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        out.append(data)
 
     ok({
         "report": "revenue_recognition_summary",
-        "rows": [row_to_dict(r) for r in rows],
-        "total_periods": len(rows),
+        "rows": out,
+        "total_periods": len(out),
     })
 
 
@@ -627,6 +919,15 @@ def update_performance_obligation(conn, args):
     row = conn.execute("SELECT * FROM advacct_performance_obligation WHERE id = ?", (ob_id,)).fetchone()
     if not row:
         err(f"Performance obligation {ob_id} not found")
+    contract_id = row_to_dict(row)["contract_id"]
+
+    for arg_name in ("standalone_price", "allocated_price"):
+        val = getattr(args, arg_name, None)
+        if val is None:
+            continue
+        parsed = _money(val)
+        if parsed is None or parsed < 0:
+            err(f"Invalid {arg_name.replace('_', '-')}: {val}")
 
     data, changed = {}, []
     for arg_name, col_name in {
@@ -644,11 +945,29 @@ def update_performance_obligation(conn, args):
     if not data:
         err("No fields to update")
 
+    current = row_to_dict(row)
+    old_values = {col: current[col] for col in changed}
     data["updated_at"] = _now_iso()
     sql, params = dynamic_update("advacct_performance_obligation", data, where={"id": ob_id})
     conn.execute(sql, params)
+    new_values = {col: data[col] for col in changed}
+
+    # Keep the contract's allocated value the sum of its obligations'
+    # allocations, as add-performance-obligation does, summed as Decimal.
+    if "allocated_price" in data:
+        prices = conn.execute(
+            "SELECT allocated_price FROM advacct_performance_obligation WHERE contract_id = ?",
+            (contract_id,)
+        ).fetchall()
+        total_allocated = sum((Decimal(p[0]) for p in prices), Decimal("0"))
+        conn.execute(
+            "UPDATE advacct_revenue_contract SET allocated_value = ?, updated_at = ? WHERE id = ?",
+            (str(total_allocated.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+             data["updated_at"], contract_id)
+        )
+
     audit(conn, SKILL, "update-performance-obligation", "advacct_performance_obligation", ob_id,
-          new_values={"updated_fields": changed})
+          old_values=old_values, new_values=new_values)
     conn.commit()
     ok({"id": ob_id, "updated_fields": changed})
 
@@ -657,36 +976,83 @@ def update_performance_obligation(conn, args):
 # 16. update-schedule-amounts
 # ===========================================================================
 def update_schedule_amounts(conn, args):
-    """Update the amount on all unrecognized schedule entries for an obligation.
+    """Re-spread the obligation's allocated price over its unrecognized periods.
 
-    Used for contract modifications (upgrade/downgrade) where only future
-    (unrecognized) periods should reflect the new amount.
+    Reads the obligation's allocated price and writes one two-decimal amount
+    per open period so the open periods plus what is already recognized sum
+    back to the allocation, with any rounding remainder on the last period.
+    Takes no --amount: set the allocation with update-performance-obligation
+    --allocated-price first. Used for contract modifications (upgrade/downgrade)
+    where only future (unrecognized) periods are re-priced.
     """
     ob_id = getattr(args, "obligation_id", None)
     if not ob_id:
         err("--obligation-id is required")
-    row = conn.execute("SELECT id FROM advacct_performance_obligation WHERE id = ?", (ob_id,)).fetchone()
+    row = conn.execute("SELECT * FROM advacct_performance_obligation WHERE id = ?", (ob_id,)).fetchone()
     if not row:
         err(f"Performance obligation {ob_id} not found")
+    obligation = row_to_dict(row)
 
-    new_amount = getattr(args, "amount", None)
-    if not new_amount:
-        err("--amount is required")
-    try:
-        Decimal(new_amount)
-    except Exception:
-        err(f"Invalid amount: {new_amount}")
+    if getattr(args, "amount", None) is not None:
+        err("update-schedule-amounts takes no --amount: it re-spreads the obligation's "
+            "allocated price over its unrecognized periods; set the allocation with "
+            "update-performance-obligation --allocated-price")
 
-    conn.execute(
-        "UPDATE advacct_revenue_schedule SET amount = ? WHERE obligation_id = ? AND recognized = 0",
-        (new_amount, ob_id)
-    )
-    updated = conn.execute("SELECT changes()").fetchone()[0]
+    raw_allocated = obligation["allocated_price"]
+    total = _money(raw_allocated)
+    if total is None or total < 0:
+        err(f"Performance obligation {ob_id} has an invalid allocated price: {raw_allocated}")
+    alloc = total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    recognized_rows = conn.execute(
+        "SELECT id, amount FROM advacct_revenue_schedule WHERE obligation_id = ? AND recognized = 1",
+        (ob_id,)).fetchall()
+    recognized_total = Decimal("0")
+    for rec in recognized_rows:
+        rec_data = row_to_dict(rec)
+        rec_amount = _money(rec_data["amount"])
+        if rec_amount is None:
+            err(f"Revenue schedule entry {rec_data['id']} holds an invalid amount: {rec_data['amount']}")
+        recognized_total += rec_amount
+    recognized_total = recognized_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    if alloc < recognized_total:
+        err(f"Allocated price {alloc} is below the {recognized_total} already recognized "
+            f"for obligation {ob_id}")
+
+    open_rows = conn.execute(
+        "SELECT * FROM advacct_revenue_schedule WHERE obligation_id = ? AND recognized = 0 "
+        "ORDER BY period_date, id",
+        (ob_id,)).fetchall()
+    open_entries = [row_to_dict(item) for item in open_rows]
+    count = len(open_entries)
+    if count == 0:
+        ok({"obligation_id": ob_id, "allocated_price": str(alloc),
+            "recognized_amount": str(recognized_total),
+            "entries_updated": 0, "amounts": []})
+
+    remaining = alloc - recognized_total
+    per_period = (remaining / count).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    last_amount = remaining - per_period * (count - 1)
+    new_amounts = [str(per_period)] * (count - 1) + [str(last_amount)]
+    old_amounts = [entry["amount"] for entry in open_entries]
+
+    spread_sql = update_row(
+        "advacct_revenue_schedule",
+        data={"amount": P()}, where={"id": P(), "recognized": 0})
+    entries_updated = 0
+    for entry, new_amount in zip(open_entries, new_amounts):
+        cursor = conn.execute(spread_sql, (new_amount, entry["id"]))
+        entries_updated += cursor.rowcount
 
     audit(conn, SKILL, "update-schedule-amounts", "advacct_revenue_schedule", ob_id,
-          new_values={"new_amount": new_amount, "entries_updated": updated})
+          old_values={"amounts": old_amounts},
+          new_values={"allocated_price": str(alloc), "recognized_amount": str(recognized_total),
+                      "entries_updated": entries_updated, "amounts": new_amounts})
     conn.commit()
-    ok({"obligation_id": ob_id, "new_amount": new_amount, "entries_updated": updated})
+    ok({"obligation_id": ob_id, "allocated_price": str(alloc),
+        "recognized_amount": str(recognized_total),
+        "entries_updated": entries_updated, "amounts": new_amounts})
 
 
 # ===========================================================================
@@ -709,20 +1075,126 @@ def recognize_schedule_entry(conn, args):
     if data["recognized"] == 1:
         err(f"Revenue schedule entry {entry_id} is already recognized")
 
-    conn.execute(
-        "UPDATE advacct_revenue_schedule SET recognized = 1 WHERE id = ?",
-        (entry_id,)
-    )
+    accts = _recognition_accounts(conn, args, data["company_id"])
+    try:
+        gl_ids = _post_recognition(conn, data, accts)
+    except (ValueError, NotImplementedError) as exc:
+        conn.rollback()
+        err(f"Revenue schedule entry {entry_id} was not recognized: "
+            f"the ledger posting was refused: {exc}")
+
     audit(conn, SKILL, "recognize-schedule-entry", "advacct_revenue_schedule", entry_id,
-          new_values={"recognized": 1})
+          new_values={"recognized": 1, "gl_entry_ids": gl_ids})
     conn.commit()
-    ok({"id": entry_id, "recognized": 1, "amount": data["amount"]})
+    ok({"id": entry_id, "recognized": 1, "amount": data["amount"], "gl_entry_ids": gl_ids})
+
+
+# ---------------------------------------------------------------------------
+# Posted contract balance presentation
+# ---------------------------------------------------------------------------
+def contract_balance_report(conn, args):
+    """Present one net contract position per project without netting contracts."""
+    company_id = getattr(args, "company_id", None)
+    c = Table("company")
+    company = conn.execute(Q.from_(c).select(c.default_currency)
+                           .where(c.id == P()).get_sql(), (company_id,)).fetchone()
+    if not company:
+        err("--company-id must name an existing company")
+    as_of = getattr(args, "as_of_date", None)
+    try:
+        if date.fromisoformat(as_of).isoformat() != as_of:
+            raise ValueError("noncanonical date")
+    except (TypeError, ValueError):
+        err("--as-of-date must be YYYY-MM-DD")
+    selected = {
+        "contract_asset": getattr(args, "contract_asset_account_id", None),
+        "contract_liability": getattr(args, "contract_liability_account_id", None),
+        "receivable": getattr(args, "receivable_account_id", None),
+    }
+    if not selected["contract_asset"] or not selected["contract_liability"]:
+        err("--contract-asset-account-id and --contract-liability-account-id are required")
+    account_ids = [value for value in selected.values() if value]
+    if len(account_ids) != len(set(account_ids)):
+        err("The selected account roles must use distinct accounts")
+    account = Table("account")
+    for role, account_id in selected.items():
+        if not account_id:
+            continue
+        row = conn.execute(Q.from_(account).select(account.root_type, account.is_group)
+                           .where(account.id == P()).where(account.company_id == P())
+                           .get_sql(), (account_id, company_id)).fetchone()
+        root = "liability" if role == "contract_liability" else "asset"
+        if not row or row["root_type"] != root or row["is_group"]:
+            err(f"The {role} account must be a {root} leaf account of this company")
+    project = Table("project")
+    projects = {row["id"]: row["project_name"] for row in conn.execute(
+        Q.from_(project).select(project.id, project.project_name)
+        .where(project.company_id == P()).get_sql(), (company_id,)).fetchall()}
+    gl = Table("gl_entry")
+    ledger = conn.execute(Q.from_(gl).select(
+        gl.account_id, gl.project_id, gl.debit_base, gl.credit_base)
+        .where(gl.account_id.isin([P() for _ in account_ids]))
+        .where(gl.is_cancelled == 0).where(gl.posting_date <= P()).get_sql(),
+        tuple(account_ids) + (as_of,)).fetchall()
+    roles = {value: key for key, value in selected.items() if value}
+    balances = {}
+    with localcontext() as context:
+        context.prec = 60
+        for row in ledger:
+            project_id = row["project_id"]
+            if project_id not in projects:
+                err("Selected posted balances contain a missing or foreign project tag; "
+                    "reconcile contract tagging before using this report")
+            amounts = []
+            for column in ("debit_base", "credit_base"):
+                raw = row[column]
+                if not isinstance(raw, str) or not re.fullmatch(
+                        r"[0-9]{1,24}(?:\.[0-9]{1,6})?", raw):
+                    err("Selected posted balances contain invalid base-currency money")
+                amounts.append(Decimal(raw))
+            values = balances.setdefault(project_id, {
+                "contract_asset": Decimal("0"), "contract_liability": Decimal("0"),
+                "receivable": Decimal("0")})
+            role = roles[row["account_id"]]
+            values[role] += (amounts[1] - amounts[0] if role == "contract_liability"
+                             else amounts[0] - amounts[1])
+        rows = []
+        asset_total = liability_total = receivable_total = Decimal("0")
+        for project_id, values in sorted(balances.items()):
+            net = (values["contract_asset"] - values["contract_liability"]).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP)
+            receivable = values["receivable"].quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            asset = max(net, Decimal("0"))
+            liability = max(-net, Decimal("0"))
+            asset_total += asset
+            liability_total += liability
+            receivable_total += receivable
+            rows.append({"project_id": project_id, "contract_label": projects[project_id],
+                         "net_contract_position": _contract_balance_amount(net),
+                         "contract_asset": _contract_balance_amount(asset), "contract_liability": _contract_balance_amount(liability),
+                         "receivable": _contract_balance_amount(receivable)})
+        ok({"report": "contract_balances", "company_id": company_id, "as_of_date": as_of,
+            "currency": company["default_currency"], "account_mapping": selected,
+            "contract_grain": "operator-designated project_id", "rows": rows,
+            "gross_contract_assets": _contract_balance_amount(asset_total),
+            "gross_contract_liabilities": _contract_balance_amount(liability_total),
+            "receivables": _contract_balance_amount(receivable_total),
+            "basis": "Currently active posted base-currency balances through the selected date; "
+                     "each contract position is rounded half up to cents before gross presentation",
+            "scope_note": "Use one project tag per contract and designated accounts only. "
+                          "This report neither determines unconditional rights nor reclassifies "
+                          "receivables, registers account types or posts ledger entries."})
+
+
+def _contract_balance_amount(value):
+    return format(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f")
 
 
 # ---------------------------------------------------------------------------
 # Action registry
 # ---------------------------------------------------------------------------
 ACTIONS = {
+    "contract-balance-report": contract_balance_report,
     "add-revenue-contract": add_revenue_contract,
     "update-revenue-contract": update_revenue_contract,
     "get-revenue-contract": get_revenue_contract,
@@ -735,6 +1207,7 @@ ACTIONS = {
     "list-variable-considerations": list_variable_considerations,
     "modify-contract": modify_contract,
     "calculate-revenue-schedule": calculate_revenue_schedule,
+    "calculate-revenue-progress": calculate_revenue_progress,
     "generate-revenue-entries": generate_revenue_entries,
     "update-schedule-amounts": update_schedule_amounts,
     "recognize-schedule-entry": recognize_schedule_entry,

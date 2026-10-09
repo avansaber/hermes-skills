@@ -15,15 +15,15 @@ import os
 import sqlite3
 import sys
 import uuid
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 
 # Add shared lib to path
 try:
     import importlib.util
     if importlib.util.find_spec("erpclaw_lib") is None:
         sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
-    from erpclaw_lib.db import get_connection, ensure_db_exists, DEFAULT_DB_PATH
+    from erpclaw_lib.db import get_connection, unexpected_error_message
     from erpclaw_lib.decimal_utils import to_decimal, round_currency
     from erpclaw_lib.validation import check_input_lengths
     from erpclaw_lib.naming import get_next_name
@@ -36,6 +36,12 @@ try:
         reprice_stock_valuation,
     )
     from erpclaw_lib.gl_posting import insert_gl_entries, reverse_gl_entries
+    from erpclaw_lib.gl_posting import insert_gl_entries, reverse_gl_entries, take_chain_heads
+    from erpclaw_lib.dimensions import (
+        parse_dimension_input,
+        validate_document_dimensions,
+        dimensions_json_text,
+    )
     # NOTE: canonical_voucher_type is deliberately NOT imported here. Its only two
     # uses in this module were the M103-de-routed gateways, which were the only
     # inventory entry points that took a caller-supplied voucher_type. Every
@@ -46,7 +52,7 @@ try:
     from erpclaw_lib.audit import audit
     from erpclaw_lib.custom_fields import store_from_arg, merge_into_response
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query_helpers import resolve_company_id
+    from erpclaw_lib.query_helpers import resolve_company_id, get_default_cost_center, get_fiscal_year, resolve_scope_company
     from erpclaw_lib.query import Q, P, Table, Field, fn, DecimalSum, DecimalAbs, dynamic_update, line_order, latest_insert_order, now
     from erpclaw_lib.vendor.pypika import Order
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
@@ -94,6 +100,8 @@ SUBCONTRACTOR_WAREHOUSE_TYPES = ("transit", "production")
 # draft/completed/stopped/cancelled cannot consume; not_started/in_process can.
 ACTIVE_WORK_ORDER_STATUSES = ("not_started", "in_process")
 
+INTERNAL_MOVE_TYPES = ("material_transfer", "manufacture", "repack", "send_to_subcontractor")
+
 
 
 # ---------------------------------------------------------------------------
@@ -109,24 +117,165 @@ def _parse_json_arg(value, name):
         err(f"Invalid JSON for --{name}: {value}")
 
 
-def _get_fiscal_year(conn, posting_date: str) -> str | None:
-    """Return the fiscal year name for a posting date, or None."""
-    fy = conn.execute(
-        "SELECT name FROM fiscal_year WHERE start_date <= ? AND end_date >= ? AND is_closed = 0",
-        (posting_date, posting_date),
-    ).fetchone()
-    return fy["name"] if fy else None
+def _parse_stock_dimensions(args):
+    try:
+        return parse_dimension_input(
+            getattr(args, "dimensions", None),
+            getattr(args, "dimension_key", None),
+            getattr(args, "dimension_value", None))
+    except ValueError as e:
+        err(str(e))
 
 
 def _get_cost_center(conn, company_id: str) -> str | None:
     """Return the first non-group cost center for a company, or None."""
-    t = Table("cost_center")
-    q = (Q.from_(t).select(t.id)
-         .where(t.company_id == P())
-         .where(t.is_group == 0)
-         .limit(1))
-    cc = conn.execute(q.get_sql(), (company_id,)).fetchone()
-    return cc["id"] if cc else None
+    return get_default_cost_center(conn, company_id)
+
+
+def _internal_transfer_gl_entries(conn, sle_rows, company_id, cost_center_id):
+    """General-ledger legs for internal movements between the company's own stores.
+
+    Each incoming row debits its own store's stock account; each outgoing
+    row credits its own store's stock account, one leg per row in the order
+    read. The legs so far balance except for value the outputs absorbed
+    above what left the stores (or below it): a net debit remainder is
+    credited to the unbilled-stock account, a net credit remainder is
+    debited to the sold-goods cost account, both carrying the cost center.
+    A zero remainder posts no extra leg and looks up neither account.
+    """
+    legs = []
+    for row in sle_rows:
+        value = to_decimal(row.get("stock_value_difference", "0"))
+        if value == 0:
+            continue
+        warehouse_id = row.get("warehouse_id")
+        wh_t = Table("warehouse")
+        wh_q = (Q.from_(wh_t).select(wh_t.account_id)
+                .where(wh_t.id == P()))
+        wh = conn.execute(wh_q.get_sql(), (warehouse_id,)).fetchone()
+        stock_account_id = wh["account_id"] if wh and wh["account_id"] else None
+        if not stock_account_id:
+            acct_t = Table("account")
+            acct_q = (Q.from_(acct_t).select(acct_t.id)
+                      .where(acct_t.account_type == P())
+                      .where(acct_t.company_id == P())
+                      .where(acct_t.is_group == 0)
+                      .limit(1))
+            found = conn.execute(acct_q.get_sql(), ("stock", company_id)).fetchone()
+            stock_account_id = found["id"] if found else None
+        if not stock_account_id:
+            raise ValueError(
+                f"No Stock-in-Hand account for company {company_id} "
+                f"(warehouse {warehouse_id} is not linked to an account and no "
+                f"account_type='stock' account exists). Run setup-company, link the "
+                f"warehouse to your Inventory account, or add-account "
+                f"--account-type stock --root-type asset."
+            )
+        if value > 0:
+            legs.append({
+                "account_id": stock_account_id,
+                "debit": str(round_currency(value)),
+                "credit": "0",
+            })
+        else:
+            legs.append({
+                "account_id": stock_account_id,
+                "debit": "0",
+                "credit": str(round_currency(-value)),
+            })
+    total_debits = sum((to_decimal(leg["debit"]) for leg in legs), Decimal("0"))
+    total_credits = sum((to_decimal(leg["credit"]) for leg in legs), Decimal("0"))
+    remainder = total_debits - total_credits
+    if remainder > 0:
+        acct_t = Table("account")
+        acct_q = (Q.from_(acct_t).select(acct_t.id)
+                  .where(acct_t.account_type == P())
+                  .where(acct_t.company_id == P())
+                  .where(acct_t.is_group == 0)
+                  .limit(1))
+        contra = conn.execute(
+            acct_q.get_sql(), ("stock_received_not_billed", company_id)).fetchone()
+        contra_account_id = contra["id"] if contra else None
+        if not contra_account_id:
+            raise ValueError(
+                f"No 'Stock Received Not Billed' account for company {company_id}. A stock "
+                f"receipt cannot post balanced GL without it. "
+                f"Run setup-company or add-account --account-type stock_received_not_billed "
+                f"--root-type liability."
+            )
+        legs.append({
+            "account_id": contra_account_id,
+            "debit": "0",
+            "credit": str(remainder),
+            "cost_center_id": cost_center_id,
+        })
+    elif remainder < 0:
+        acct_t = Table("account")
+        acct_q = (Q.from_(acct_t).select(acct_t.id)
+                  .where(acct_t.account_type == P())
+                  .where(acct_t.company_id == P())
+                  .where(acct_t.is_group == 0)
+                  .limit(1))
+        contra = conn.execute(
+            acct_q.get_sql(), ("cost_of_goods_sold", company_id)).fetchone()
+        contra_account_id = contra["id"] if contra else None
+        if not contra_account_id:
+            raise ValueError(
+                f"No 'Cost of Goods Sold' account for company {company_id}. A stock "
+                f"issue cannot post balanced GL without it. "
+                f"Run setup-company or add-account --account-type cost_of_goods_sold "
+                f"--root-type expense."
+            )
+        legs.append({
+            "account_id": contra_account_id,
+            "debit": str(-remainder),
+            "credit": "0",
+            "cost_center_id": cost_center_id,
+        })
+    return legs
+
+
+def _parse_non_negative_number(raw, flag):
+    try:
+        value = to_decimal(raw)
+    except (ValueError, TypeError, InvalidOperation):
+        err(f"{flag} must be a non-negative number")
+    if not value.is_finite():
+        err(f"{flag} must be a non-negative number")
+    if value < 0:
+        err(f"{flag} must be a non-negative number")
+    try:
+        return str(round_currency(value))
+    except InvalidOperation:
+        err(f"{flag} must be a non-negative number")
+
+
+def _parse_paging(args, default_limit=20, default_offset=0):
+    raw_limit = getattr(args, "limit", None)
+    raw_offset = getattr(args, "offset", None)
+    if raw_limit is None or (isinstance(raw_limit, str) and raw_limit.strip() == ""):
+        limit = default_limit
+    else:
+        if isinstance(raw_limit, bool) or isinstance(raw_limit, float):
+            err("--limit must be a positive integer")
+        try:
+            limit = int(raw_limit.strip()) if isinstance(raw_limit, str) else int(raw_limit)
+        except (ValueError, TypeError):
+            err("--limit must be a positive integer")
+        if limit <= 0:
+            err("--limit must be a positive integer")
+    if raw_offset is None or (isinstance(raw_offset, str) and raw_offset.strip() == ""):
+        offset = default_offset
+    else:
+        if isinstance(raw_offset, bool) or isinstance(raw_offset, float):
+            err("--offset must be a non-negative integer")
+        try:
+            offset = int(raw_offset.strip()) if isinstance(raw_offset, str) else int(raw_offset)
+        except (ValueError, TypeError):
+            err("--offset must be a non-negative integer")
+        if offset < 0:
+            err("--offset must be a non-negative integer")
+    return limit, offset
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +368,13 @@ def update_item(conn, args):
         data["item_name"] = args.item_name
         updated_fields.append("item_name")
     if args.reorder_level is not None:
-        data["reorder_level"] = args.reorder_level
+        data["reorder_level"] = _parse_non_negative_number(args.reorder_level, "--reorder-level")
         updated_fields.append("reorder_level")
     if args.reorder_qty is not None:
-        data["reorder_qty"] = args.reorder_qty
+        data["reorder_qty"] = _parse_non_negative_number(args.reorder_qty, "--reorder-qty")
         updated_fields.append("reorder_qty")
     if args.standard_rate is not None:
-        data["standard_rate"] = str(round_currency(to_decimal(args.standard_rate)))
+        data["standard_rate"] = _parse_non_negative_number(args.standard_rate, "--standard-rate")
         updated_fields.append("standard_rate")
     if args.item_status is not None:
         if args.item_status not in ("active", "disabled"):
@@ -240,8 +389,11 @@ def update_item(conn, args):
     sql, params = dynamic_update("item", data, where={"id": args.item_id})
     conn.execute(sql, params)
 
+    previous = row_to_dict(item)
+    changed = {k: v for k, v in data.items() if k != "updated_at"}
     audit(conn, "erpclaw-inventory", "update-item", "item", args.item_id,
-           new_values={"updated_fields": updated_fields})
+           old_values={k: previous.get(k) for k in changed},
+           new_values=dict(changed))
     conn.commit()
     ok({"item_id": args.item_id, "updated_fields": updated_fields})
 
@@ -346,8 +498,7 @@ def list_items(conn, args):
     count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
-    limit = int(args.limit) if args.limit else 20
-    offset = int(args.offset) if args.offset else 0
+    limit, offset = _parse_paging(args)
 
     rows_q = (Q.from_(i)
               .left_join(ig).on(ig.id == i.item_group_id)
@@ -569,8 +720,7 @@ def list_item_groups(conn, args):
     count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
-    limit = int(args.limit) if args.limit else 20
-    offset = int(args.offset) if args.offset else 0
+    limit, offset = _parse_paging(args)
 
     rows_q = (Q.from_(t).select(t.star)
               .orderby(t.name)
@@ -597,6 +747,37 @@ def list_item_groups(conn, args):
 # 7. add-warehouse
 # ---------------------------------------------------------------------------
 
+def add_bin_location(conn, args):
+    """Create a stock-holding leaf beneath an owned warehouse group."""
+    if not getattr(args, "company_id", None) or not getattr(args, "parent_id", None):
+        err("--company-id and --parent-id are required")
+    name = getattr(args, "name", None)
+    if not isinstance(name, str) or not name.strip() or name != name.strip():
+        err("--name must be a nonempty bin name without surrounding whitespace")
+    wh = Table("warehouse")
+    query = (Q.from_(wh).select(wh.account_id).where(wh.id == P())
+             .where(wh.company_id == P()).where(wh.is_group == 1))
+    parent = conn.execute(query.get_sql(), (args.parent_id, args.company_id)).fetchone()
+    if not parent:
+        err("Parent must be a warehouse group belonging to --company-id")
+    account_id = getattr(args, "account_id", None) or parent["account_id"]
+    acct = Table("account")
+    query = (Q.from_(acct).select(acct.id).where(acct.id == P())
+             .where(acct.company_id == P()).where(acct.root_type == "asset")
+             .where(acct.account_type == "stock").where(acct.is_group == 0))
+    if not account_id or not conn.execute(query.get_sql(), (account_id, args.company_id)).fetchone():
+        err("An owned leaf stock account is required, through --account-id or the parent")
+    query = (Q.from_(wh).select(wh.id).where(wh.company_id == P())
+             .where(wh.parent_id == P()).where(wh.name == P()))
+    if conn.execute(query.get_sql(), (args.company_id, args.parent_id, name)).fetchone():
+        err("A warehouse with that name already exists beneath this parent")
+    bin_args = argparse.Namespace(**vars(args))
+    bin_args.account_id = account_id
+    bin_args.warehouse_type = "stores"
+    bin_args.is_group = "0"
+    add_warehouse(conn, bin_args)
+
+
 def add_warehouse(conn, args):
     """Create a warehouse."""
     if not args.name:
@@ -622,10 +803,13 @@ def add_warehouse(conn, args):
 
     if args.account_id:
         acct_t = Table("account")
-        acct_q = Q.from_(acct_t).select(acct_t.id).where(acct_t.id == P())
+        acct_q = Q.from_(acct_t).select(acct_t.id, acct_t.company_id).where(acct_t.id == P())
         acct = conn.execute(acct_q.get_sql(), (args.account_id,)).fetchone()
         if not acct:
             err(f"Account {args.account_id} not found")
+        if acct["company_id"] != args.company_id:
+            err(f"Account {args.account_id} belongs to company {acct['company_id']}, "
+                f"not to the warehouse's company {args.company_id}")
 
     is_group = int(args.is_group) if args.is_group else 0
     wh_id = str(uuid.uuid4())
@@ -655,12 +839,41 @@ def update_warehouse(conn, args):
     if not args.warehouse_id:
         err("--warehouse-id is required")
 
+    value = args.warehouse_id
+    company_scope = getattr(args, "company_id", None)
     wh_t = Table("warehouse")
-    wh_q = (Q.from_(wh_t).select(wh_t.star)
-            .where((wh_t.id == P()) | (wh_t.name == P())))
-    wh = conn.execute(wh_q.get_sql(), (args.warehouse_id, args.warehouse_id)).fetchone()
-    if not wh:
-        err(f"Warehouse {args.warehouse_id} not found")
+    wh = None
+    if company_scope:
+        by_id = (Q.from_(wh_t).select(wh_t.star)
+                 .where(wh_t.id == P()).where(wh_t.company_id == P()))
+        wh = conn.execute(by_id.get_sql(), (value, company_scope)).fetchone()
+        if wh is None:
+            any_id = Q.from_(wh_t).select(wh_t.id).where(wh_t.id == P())
+            if conn.execute(any_id.get_sql(), (value,)).fetchone():
+                err(f"Warehouse {value} not found")
+            by_name = (Q.from_(wh_t).select(wh_t.star)
+                       .where(wh_t.name == P()).where(wh_t.company_id == P()))
+            named = conn.execute(by_name.get_sql(), (value, company_scope)).fetchall()
+            if len(named) == 1:
+                wh = named[0]
+            elif not named:
+                err(f"Warehouse {value} not found")
+            else:
+                err(f"Warehouse name '{value}' matches more than one warehouse "
+                    f"in company {company_scope}; pass the warehouse id")
+    else:
+        by_id = Q.from_(wh_t).select(wh_t.star).where(wh_t.id == P())
+        wh = conn.execute(by_id.get_sql(), (value,)).fetchone()
+        if wh is None:
+            by_name = Q.from_(wh_t).select(wh_t.star).where(wh_t.name == P())
+            named = conn.execute(by_name.get_sql(), (value,)).fetchall()
+            if len(named) == 1:
+                wh = named[0]
+            elif not named:
+                err(f"Warehouse {value} not found")
+            else:
+                err(f"Warehouse name '{value}' matches more than one warehouse; "
+                    f"pass the warehouse id or --company-id")
     args.warehouse_id = wh["id"]  # normalize to id
 
     data, updated_fields = {}, []
@@ -670,10 +883,13 @@ def update_warehouse(conn, args):
         updated_fields.append("name")
     if args.account_id is not None:
         acct_t = Table("account")
-        acct_q = Q.from_(acct_t).select(acct_t.id).where(acct_t.id == P())
+        acct_q = Q.from_(acct_t).select(acct_t.id, acct_t.company_id).where(acct_t.id == P())
         acct = conn.execute(acct_q.get_sql(), (args.account_id,)).fetchone()
         if not acct:
             err(f"Account {args.account_id} not found")
+        if acct["company_id"] != wh["company_id"]:
+            err(f"Account {args.account_id} belongs to company {acct['company_id']}, "
+                f"not to the warehouse's company {wh['company_id']}")
         data["account_id"] = args.account_id
         updated_fields.append("account_id")
 
@@ -684,8 +900,11 @@ def update_warehouse(conn, args):
     sql, params = dynamic_update("warehouse", data, where={"id": args.warehouse_id})
     conn.execute(sql, params)
 
+    previous = row_to_dict(wh)
+    changed = {k: v for k, v in data.items() if k != "updated_at"}
     audit(conn, "erpclaw-inventory", "update-warehouse", "warehouse", args.warehouse_id,
-           new_values={"updated_fields": updated_fields})
+           old_values={k: previous.get(k) for k in changed},
+           new_values=dict(changed))
     conn.commit()
     ok({"warehouse_id": args.warehouse_id, "updated_fields": updated_fields})
 
@@ -717,8 +936,7 @@ def list_warehouses(conn, args):
     count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
-    limit = int(args.limit) if args.limit else 20
-    offset = int(args.offset) if args.offset else 0
+    limit, offset = _parse_paging(args)
 
     rows_q = (Q.from_(w).select(w.star)
               .where(w.company_id == P())
@@ -808,7 +1026,97 @@ def _guard_open_order_line(conn, entry_type, company_id, item_id):
                 f"delivered and the stock is not subtracted twice.")
 
 
-def add_stock_entry(conn, args):
+def add_location_resupply(conn, args):
+    """Create an ordinary transfer draft when a destination needs stock."""
+    required = ("company_id", "item_id", "warehouse_id", "target_warehouse_id",
+                "posting_date", "min_qty", "max_qty")
+    for name in required:
+        if getattr(args, name, None) in (None, ""):
+            err(f"--{name.replace('_', '-')} is required")
+    try:
+        day = datetime.strptime(args.posting_date, "%Y-%m-%d").date()
+        if day.isoformat() != args.posting_date:
+            raise ValueError
+    except (TypeError, ValueError):
+        err("--posting-date must be an ISO date")
+    limits = []
+    for name in ("min_qty", "max_qty"):
+        value = getattr(args, name)
+        try:
+            if isinstance(value, (bool, float)):
+                raise ValueError
+            amount = Decimal(str(value))
+            if (not amount.is_finite() or amount < 0 or amount > Decimal("1000000000")
+                    or amount != amount.quantize(Decimal("0.01"))):
+                raise ValueError
+        except (InvalidOperation, ValueError):
+            err(f"--{name.replace('_', '-')} must be a nonnegative quantity with at most two decimal places, up to 1000000000")
+        limits.append(amount)
+    minimum, maximum = limits
+    if maximum <= minimum:
+        err("--max-qty must be greater than --min-qty")
+    if args.warehouse_id == args.target_warehouse_id:
+        err("Source and target warehouses must differ")
+    co = Table("company")
+    query = Q.from_(co).select(co.id).where(co.id == P())
+    if not conn.execute(query.get_sql(), (args.company_id,)).fetchone():
+        err("Company not found")
+    wh = Table("warehouse")
+    for warehouse_id in (args.warehouse_id, args.target_warehouse_id):
+        query = (Q.from_(wh).select(wh.id).where(wh.id == P())
+                 .where(wh.company_id == P()).where(wh.is_group == 0))
+        if not conn.execute(query.get_sql(), (warehouse_id, args.company_id)).fetchone():
+            err("Both warehouses must be leaf warehouses belonging to --company-id")
+    # Items are shared catalogue records; stock is scoped through owned warehouses.
+    item = Table("item")
+    query = (Q.from_(item).select(item.id, item.is_stock_item, item.has_batch,
+                                 item.has_serial).where(item.id == P())
+             .where(item.status == "active"))
+    row = conn.execute(query.get_sql(), (args.item_id,)).fetchone()
+    if not row or not row["is_stock_item"]:
+        err("An active stock item is required")
+    if row["has_batch"] or row["has_serial"]:
+        err("Batch and serial items require an explicit stock-entry transfer")
+    destination = to_decimal(get_stock_balance(
+        conn, args.item_id, args.target_warehouse_id, args.posting_date)["qty"])
+    if destination >= minimum:
+        ok({"triggered": False, "destination_qty": str(destination)})
+    quantity = maximum - destination
+    if quantity <= 0 or quantity > Decimal("1000000000") or quantity != round_currency(quantity):
+        err("Required transfer quantity must be positive, at most two decimal places, and within 1000000000")
+    se, line = Table("stock_entry"), Table("stock_entry_item")
+    query = (Q.from_(se).join(line).on(line.stock_entry_id == se.id)
+             .select(se.id, se.naming_series).where(se.company_id == P())
+             .where(se.status == "draft").where(se.stock_entry_type == "material_transfer")
+             .where(line.item_id == P()).where(line.from_warehouse_id == P())
+             .where(line.to_warehouse_id == P()).orderby(se.id).limit(1))
+    existing = conn.execute(query.get_sql(), (args.company_id, args.item_id,
+                            args.warehouse_id, args.target_warehouse_id)).fetchone()
+    if existing:
+        ok({"stock_entry_id": existing["id"], "naming_series": existing["naming_series"],
+            "existing_draft": True, "triggered": True})
+    source = to_decimal(get_stock_balance(
+        conn, args.item_id, args.warehouse_id, args.posting_date)["qty"])
+    reservation = Table("stock_reservation_entry")
+    query = (Q.from_(reservation).join(wh).on(reservation.warehouse_id == wh.id)
+             .select(reservation.reserved_qty).where(wh.company_id == P())
+             .where(reservation.company_id == P())
+             .where(reservation.warehouse_id == P()).where(reservation.item_id == P())
+             .where(reservation.status == "active"))
+    reserved = sum((to_decimal(row["reserved_qty"]) for row in conn.execute(
+        query.get_sql(), (args.company_id, args.company_id, args.warehouse_id, args.item_id)).fetchall()),
+        Decimal("0"))
+    if source - reserved < quantity:
+        err("Source warehouse has insufficient unreserved stock for the requested maximum")
+    draft_args = argparse.Namespace(**vars(args))
+    draft_args.entry_type = "transfer"
+    draft_args.items = json.dumps([{"item_id": args.item_id, "qty": str(quantity),
+                                   "from_warehouse_id": args.warehouse_id,
+                                   "to_warehouse_id": args.target_warehouse_id}])
+    add_stock_entry(conn, draft_args)
+
+
+def add_stock_entry(conn, args, *, purpose_reference=None):
     """Create a stock entry in draft."""
     if not args.entry_type:
         err("--entry-type is required "
@@ -830,6 +1138,14 @@ def add_stock_entry(conn, args):
     if not conn.execute(co_q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
+    dims_obj = _parse_stock_dimensions(args)
+    if dims_obj:
+        try:
+            validate_document_dimensions(conn, dims_obj)
+        except ValueError as e:
+            err(str(e))
+    dims_text = dimensions_json_text(dims_obj)
+
     items = _parse_json_arg(args.items, "items")
     if not items or not isinstance(items, list):
         err("--items must be a non-empty JSON array")
@@ -839,6 +1155,10 @@ def add_stock_entry(conn, args):
     # the per-item loop rather than per line.
     purpose_ref_type = None
     purpose_ref_id = None
+    if purpose_reference is not None:
+        if entry_type != "material_transfer":
+            err("A putaway reference requires a transfer draft")
+        purpose_ref_type, purpose_ref_id = purpose_reference
 
     if entry_type == "send_to_subcontractor":
         # Materials move OUT to a supplier sub-store; that warehouse must be a
@@ -1014,14 +1334,15 @@ def add_stock_entry(conn, args):
         "id", "naming_series", "stock_entry_type", "posting_date",
         "total_incoming_value", "total_outgoing_value", "value_difference",
         "purpose_reference_type", "purpose_reference_id",
-        "status", "company_id",
-    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), "draft", P())
+        "status", "company_id", "dimensions_json",
+    ).insert(P(), P(), P(), P(), P(), P(), P(), P(), P(), "draft", P(), P())
     conn.execute(
         se_q.get_sql(),
         (se_id, naming, entry_type, args.posting_date,
          str(round_currency(total_incoming)),
          str(round_currency(total_outgoing)),
-         str(value_diff), purpose_ref_type, purpose_ref_id, args.company_id),
+         str(value_diff), purpose_ref_type, purpose_ref_id, args.company_id,
+         dims_text),
     )
 
     # Now insert child stock_entry_item rows
@@ -1041,6 +1362,154 @@ def add_stock_entry(conn, args):
          "total_incoming_value": str(round_currency(total_incoming)),
          "total_outgoing_value": str(round_currency(total_outgoing)),
          "value_difference": str(value_diff)})
+
+
+def _scan_company(conn, args):
+    company_id = getattr(args, "company_id", None)
+    if not company_id:
+        err("--company-id is required")
+    company = Table("company")
+    query = Q.from_(company).select(company.id).where(company.id == P())
+    if not conn.execute(query.get_sql(), (company_id,)).fetchone():
+        err("Company not found")
+    return company_id
+
+
+def _scan_decimal(value, label, *, allow_zero=False):
+    if not isinstance(value, str):
+        err(f"{label} must be a Decimal string")
+    try:
+        amount = Decimal(value)
+        if (not amount.is_finite() or amount < 0
+                or (not allow_zero and amount == 0)
+                or amount > Decimal("1000000000")
+                or amount != amount.quantize(Decimal("0.01"))):
+            err(f"{label} must be finite, within 1 billion and exact to cents")
+    except (InvalidOperation, ValueError):
+        err(f"Invalid {label}")
+    return str(amount.quantize(Decimal("0.01")))
+
+
+def _scan_item(conn, item_id):
+    item = Table("item")
+    query = Q.from_(item).select(
+        item.id, item.item_type, item.status, item.has_batch, item.has_serial,
+    ).where(item.id == P())
+    row = conn.execute(query.get_sql(), (item_id,)).fetchone()
+    if not row or row["status"] != "active" or row["item_type"] != "stock":
+        err("Barcode requires an active stock item")
+    if row["has_batch"] or row["has_serial"]:
+        err("Tracked stock needs the normal batch or serial document flow")
+    return row["id"]
+
+
+def add_item_barcode(conn, args):
+    """Register an explicit barcode for a company using the shared item catalogue."""
+    company_id = _scan_company(conn, args)
+    barcode = getattr(args, "barcode", None)
+    item_id = getattr(args, "item_id", None)
+    if not isinstance(barcode, str) or not barcode.strip() or barcode != barcode.strip():
+        err("--barcode must be a non-empty code without surrounding spaces")
+    if len(barcode) > 128 or any(ord(char) < 32 for char in barcode):
+        err("--barcode must be at most 128 characters without control characters")
+    _scan_item(conn, item_id)
+    mapping = Table("item_barcode")
+    existing = Q.from_(mapping).select(mapping.id).where(
+        (mapping.company_id == P()) & (mapping.barcode == P()))
+    if conn.execute(existing.get_sql(), (company_id, barcode)).fetchone():
+        err("Barcode already registered for this company")
+    mapping_id = str(uuid.uuid4())
+    query = Q.into(mapping).columns("id", "company_id", "item_id", "barcode").insert(
+        P(), P(), P(), P())
+    conn.execute(query.get_sql(), (mapping_id, company_id, item_id, barcode))
+    audit(conn, "erpclaw-inventory", "add-item-barcode", "item_barcode", mapping_id,
+          new_values={"company_id": company_id, "item_id": item_id, "barcode": barcode})
+    conn.commit()
+    ok({"item_barcode_id": mapping_id, "item_id": item_id, "barcode": barcode,
+        "company_id": company_id})
+
+
+def _scan_lines(conn, args, operation):
+    """Resolve all scan lines before the normal document writer is called."""
+    company_id = _scan_company(conn, args)
+    if getattr(args, "items", None):
+        err("Use --scans only, not --items")
+    try:
+        date = datetime.strptime(args.posting_date, "%Y-%m-%d")
+        if date.strftime("%Y-%m-%d") != args.posting_date:
+            err("--posting-date must be a valid YYYY-MM-DD date")
+    except (TypeError, ValueError, AttributeError):
+        err("--posting-date must be a valid YYYY-MM-DD date")
+    if (getattr(args, "dimensions", None) or getattr(args, "dimension_key", None)
+            or getattr(args, "dimension_value", None)):
+        err("Use the normal document flow for dimension-tagged stock")
+    scans = _parse_json_arg(getattr(args, "scans", None), "scans")
+    if not isinstance(scans, list) or not scans or len(scans) > 500:
+        err("--scans must be a non-empty JSON array of at most 500 lines")
+    lines, seen = [], set()
+    for scan in scans:
+        allowed = {"barcode", "qty"} | {
+            "receive": {"rate", "to_warehouse_id"},
+            "issue": {"from_warehouse_id"},
+            "transfer": {"from_warehouse_id", "to_warehouse_id"},
+            "count": {"valuation_rate", "warehouse_id"},
+        }[operation]
+        if not isinstance(scan, dict) or set(scan) - allowed:
+            err("Scan line has unsupported fields")
+        if not isinstance(scan.get("barcode"), str) or not scan["barcode"]:
+            err("Each scan needs a barcode string")
+        mapping = Table("item_barcode")
+        query = Q.from_(mapping).select(mapping.item_id).where(
+            (mapping.company_id == P()) & (mapping.barcode == P()))
+        row = conn.execute(query.get_sql(), (company_id, scan.get("barcode"))).fetchone()
+        if not row:
+            err("Barcode is not registered for this company")
+        item_id = _scan_item(conn, row["item_id"])
+        line = {"item_id": item_id, "qty": _scan_decimal(
+            scan.get("qty"), "qty", allow_zero=operation == "count")}
+        keys = ({"receive": ("to_warehouse_id",), "issue": ("from_warehouse_id",),
+                 "transfer": ("from_warehouse_id", "to_warehouse_id"),
+                 "count": ("warehouse_id",)})[operation]
+        for key in keys:
+            warehouse = Table("warehouse")
+            query = Q.from_(warehouse).select(warehouse.id).where(
+                (warehouse.id == P()) & (warehouse.company_id == P())
+                & (warehouse.is_group == 0))
+            if not conn.execute(query.get_sql(), (scan.get(key), company_id)).fetchone():
+                err(f"{key} must be a leaf warehouse belonging to this company")
+            line[key] = scan[key]
+        if operation == "transfer" and line[keys[0]] == line[keys[1]]:
+            err("Transfer source and destination must differ")
+        if operation in ("receive", "count"):
+            rate_key = "valuation_rate" if operation == "count" else "rate"
+            line[rate_key] = _scan_decimal(scan.get(rate_key), rate_key,
+                                           allow_zero=operation == "count")
+        elif "rate" in scan:
+            err("Issue and transfer rates come from existing stock valuation")
+        identity = (item_id,) + tuple(line[key] for key in keys)
+        if identity in seen:
+            err("Duplicate scanned item and warehouse line; combine its quantity")
+        seen.add(identity)
+        if operation in ("receive", "issue"):
+            _guard_open_order_line(conn, ENTRY_TYPE_MAP[operation], company_id, item_id)
+        lines.append(line)
+    return lines
+
+
+def add_scanned_stock_entry(conn, args):
+    """Create a normal receipt, issue or transfer draft from explicit scans."""
+    if getattr(args, "entry_type", None) not in ("receive", "issue", "transfer"):
+        err("--entry-type must be receive, issue or transfer")
+    lines = _scan_lines(conn, args, args.entry_type)
+    args.items = json.dumps(lines)
+    add_stock_entry(conn, args)
+
+
+def add_scanned_stock_count(conn, args):
+    """Create a normal physical-count draft from explicit scanned quantities."""
+    lines = _scan_lines(conn, args, "count")
+    args.items = json.dumps(lines)
+    add_stock_reconciliation(conn, args)
 
 
 def add_repack_stock_entry(conn, args):
@@ -1108,11 +1577,17 @@ def get_stock_entry(conn, args):
     if not args.stock_entry_id:
         err("--stock-entry-id is required")
 
+    scope_company_id = None
+    if getattr(args, "company_id", None) or getattr(args, "company_name", None):
+        scope_company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
+
     se_t = Table("stock_entry")
     se_q = Q.from_(se_t).select(se_t.star).where(se_t.id == P())
     se = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
     if not se:
         err(f"Stock entry {args.stock_entry_id} not found")
+    if scope_company_id and se["company_id"] != scope_company_id:
+        err(f"Stock entry {args.stock_entry_id} belongs to another company")
 
     data = row_to_dict(se)
 
@@ -1164,8 +1639,7 @@ def list_stock_entries(conn, args):
     count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
-    limit = int(args.limit) if args.limit else 20
-    offset = int(args.offset) if args.offset else 0
+    limit, offset = _parse_paging(args)
 
     rows_q = (Q.from_(se)
               .select(se.id, se.naming_series, se.stock_entry_type, se.posting_date,
@@ -1222,93 +1696,62 @@ def submit_stock_entry(conn, args):
     if se["status"] != "draft":
         err(f"Cannot submit: stock entry is '{se['status']}' (must be 'draft')")
 
-    se_dict = row_to_dict(se)
-    company_id = se_dict["company_id"]
-    posting_date = se_dict["posting_date"]
-    entry_type = se_dict["stock_entry_type"]
+    try:
+        take_chain_heads(conn, [se["company_id"]])
+        se = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
+        if not se:
+            conn.rollback()
+            err(f"Stock entry {args.stock_entry_id} not found")
+        if se["status"] != "draft":
+            conn.rollback()
+            err(f"Cannot submit: stock entry is '{se['status']}' (must be 'draft')")
 
-    # Fetch items
-    sei_t = Table("stock_entry_item")
-    sei_q = (Q.from_(sei_t).select(sei_t.star)
-             .where(sei_t.stock_entry_id == P())
-             .orderby(line_order()))
-    items = conn.execute(sei_q.get_sql(), (args.stock_entry_id,)).fetchall()
-    if not items:
-        err("Stock entry has no items")
+        se_dict = row_to_dict(se)
+        company_id = se_dict["company_id"]
+        posting_date = se_dict["posting_date"]
+        entry_type = se_dict["stock_entry_type"]
 
-    # Open-order guard (F8): re-checked at submit because an order may have
-    # been confirmed after the draft was created. Blocks BEFORE any SLE/GL
-    # write (nothing below is written until insert_sle_entries).
-    if entry_type in ("material_receipt", "material_issue"):
+        try:
+            doc_dims = json.loads(se_dict.get("dimensions_json") or "{}")
+        except ValueError:
+            err("Stored dimensions are not valid JSON; re-create the document")
+        if not isinstance(doc_dims, dict):
+            err("Stored dimensions are not a JSON object; re-create the document")
+
+        # Fetch items
+        sei_t = Table("stock_entry_item")
+        sei_q = (Q.from_(sei_t).select(sei_t.star)
+                 .where(sei_t.stock_entry_id == P())
+                 .orderby(line_order()))
+        items = conn.execute(sei_q.get_sql(), (args.stock_entry_id,)).fetchall()
+        if not items:
+            err("Stock entry has no items")
+
+        # Open-order guard (F8): re-checked at submit because an order may have
+        # been confirmed after the draft was created. Blocks BEFORE any SLE/GL
+        # write (nothing below is written until insert_sle_entries).
+        if entry_type in ("material_receipt", "material_issue"):
+            for item_row in items:
+                _guard_open_order_line(conn, entry_type, company_id,
+                                       item_row["item_id"])
+
+        # Find fiscal year for the posting date
+        fiscal_year = get_fiscal_year(conn, posting_date, company_id=se_dict["company_id"])
+
+        # Find cost center for P&L accounts (COGS)
+        cost_center_id = doc_dims.get("cost_center") or _get_cost_center(conn, company_id)
+
+        # Build SLE entries from stock entry items
+        sle_entries = []
         for item_row in items:
-            _guard_open_order_line(conn, entry_type, company_id,
-                                   item_row["item_id"])
+            item = row_to_dict(item_row)
+            qty = to_decimal(item["quantity"])
+            rate = to_decimal(item["valuation_rate"])
+            from_wh = item.get("from_warehouse_id")
+            to_wh = item.get("to_warehouse_id")
 
-    # Find fiscal year for the posting date
-    fiscal_year = _get_fiscal_year(conn, posting_date)
-
-    # Find cost center for P&L accounts (COGS)
-    cost_center_id = _get_cost_center(conn, company_id)
-
-    # Build SLE entries from stock entry items
-    sle_entries = []
-    for item_row in items:
-        item = row_to_dict(item_row)
-        qty = to_decimal(item["quantity"])
-        rate = to_decimal(item["valuation_rate"])
-        from_wh = item.get("from_warehouse_id")
-        to_wh = item.get("to_warehouse_id")
-
-        if entry_type == "material_receipt":
-            # Positive qty at to_warehouse
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": to_wh,
-                "actual_qty": str(round_currency(qty)),
-                "incoming_rate": str(round_currency(rate)),
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-                # FINDING-010 / ADR-0014: a standalone material_receipt is a true
-                # external receipt — it must carry a stated rate (or the item's
-                # standard_rate), never silently book inventory at $0. Internal
-                # moves (transfer-in, manufacture FG leg) below do NOT opt in.
-                "require_rate": True,
-            })
-        elif entry_type == "material_issue":
-            # Negative qty at from_warehouse
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": from_wh,
-                "actual_qty": str(round_currency(-qty)),
-                "incoming_rate": "0",
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-            })
-        elif entry_type == "material_transfer":
-            # Negative at from_warehouse, positive at to_warehouse
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": from_wh,
-                "actual_qty": str(round_currency(-qty)),
-                "incoming_rate": "0",
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-            })
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": to_wh,
-                "actual_qty": str(round_currency(qty)),
-                "incoming_rate": str(round_currency(rate)),
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-            })
-        elif entry_type == "manufacture":
-            # Finished goods to to_warehouse, raw materials from from_warehouse
-            if to_wh:
+            if entry_type == "material_receipt":
+                # Positive qty at to_warehouse
                 sle_entries.append({
                     "item_id": item["item_id"],
                     "warehouse_id": to_wh,
@@ -1317,36 +1760,14 @@ def submit_stock_entry(conn, args):
                     "batch_id": item.get("batch_id"),
                     "serial_number": item.get("serial_numbers"),
                     "fiscal_year": fiscal_year,
-                })
-            if from_wh:
-                sle_entries.append({
-                    "item_id": item["item_id"],
-                    "warehouse_id": from_wh,
-                    "actual_qty": str(round_currency(-qty)),
-                    "incoming_rate": "0",
-                    "batch_id": item.get("batch_id"),
-                    "serial_number": item.get("serial_numbers"),
-                    "fiscal_year": fiscal_year,
-                })
-        elif entry_type == "repack":
-            # Each repack line is single-direction (enforced at add time):
-            #   input line  → from_wh set → consume (negative qty)
-            #   output line → to_wh set   → produce (positive qty at its rate)
-            # The cost-balance invariant (input value == output value) was already
-            # verified at draft, so the SLE pair nets to zero stock-value change.
-            if to_wh:
-                sle_entries.append({
-                    "item_id": item["item_id"],
-                    "warehouse_id": to_wh,
-                    "actual_qty": str(round_currency(qty)),
-                    "incoming_rate": str(round_currency(rate)),
-                    "batch_id": item.get("batch_id"),
-                    "serial_number": item.get("serial_numbers"),
-                    "fiscal_year": fiscal_year,
-                    # The produced item must carry a stated value, never $0.
+                    # FINDING-010 / ADR-0014: a standalone material_receipt is a true
+                    # external receipt — it must carry a stated rate (or the item's
+                    # standard_rate), never silently book inventory at $0. Internal
+                    # moves (transfer-in, manufacture FG leg) below do NOT opt in.
                     "require_rate": True,
                 })
-            else:
+            elif entry_type == "material_issue":
+                # Negative qty at from_warehouse
                 sle_entries.append({
                     "item_id": item["item_id"],
                     "warehouse_id": from_wh,
@@ -1356,123 +1777,219 @@ def submit_stock_entry(conn, args):
                     "serial_number": item.get("serial_numbers"),
                     "fiscal_year": fiscal_year,
                 })
-        elif entry_type == "send_to_subcontractor":
-            # Transfer OUT: negative at from_wh, positive at the subcontractor
-            # sub-store (to_wh was forced to the validated supplier warehouse at
-            # add time). The sub-store leg inherits the source valuation.
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": from_wh,
-                "actual_qty": str(round_currency(-qty)),
-                "incoming_rate": "0",
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-            })
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": to_wh,
-                "actual_qty": str(round_currency(qty)),
-                "incoming_rate": str(round_currency(rate)),
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-            })
-        elif entry_type == "material_consumption":
-            # Issue raw materials against the work order: negative at from_wh.
-            sle_entries.append({
-                "item_id": item["item_id"],
-                "warehouse_id": from_wh,
-                "actual_qty": str(round_currency(-qty)),
-                "incoming_rate": "0",
-                "batch_id": item.get("batch_id"),
-                "serial_number": item.get("serial_numbers"),
-                "fiscal_year": fiscal_year,
-            })
+            elif entry_type == "material_transfer":
+                # Negative at from_warehouse, positive at to_warehouse
+                sle_entries.append({
+                    "item_id": item["item_id"],
+                    "warehouse_id": from_wh,
+                    "actual_qty": str(round_currency(-qty)),
+                    "incoming_rate": "0",
+                    "batch_id": item.get("batch_id"),
+                    "serial_number": item.get("serial_numbers"),
+                    "fiscal_year": fiscal_year,
+                })
+                sle_entries.append({
+                    "item_id": item["item_id"],
+                    "warehouse_id": to_wh,
+                    "actual_qty": str(round_currency(qty)),
+                    "incoming_rate": str(round_currency(rate)),
+                    "batch_id": item.get("batch_id"),
+                    "serial_number": item.get("serial_numbers"),
+                    "fiscal_year": fiscal_year,
+                })
+            elif entry_type == "manufacture":
+                # Finished goods to to_warehouse, raw materials from from_warehouse
+                if to_wh:
+                    sle_entries.append({
+                        "item_id": item["item_id"],
+                        "warehouse_id": to_wh,
+                        "actual_qty": str(round_currency(qty)),
+                        "incoming_rate": str(round_currency(rate)),
+                        "batch_id": item.get("batch_id"),
+                        "serial_number": item.get("serial_numbers"),
+                        "fiscal_year": fiscal_year,
+                    })
+                if from_wh:
+                    sle_entries.append({
+                        "item_id": item["item_id"],
+                        "warehouse_id": from_wh,
+                        "actual_qty": str(round_currency(-qty)),
+                        "incoming_rate": "0",
+                        "batch_id": item.get("batch_id"),
+                        "serial_number": item.get("serial_numbers"),
+                        "fiscal_year": fiscal_year,
+                    })
+            elif entry_type == "repack":
+                # Each repack line is single-direction (enforced at add time):
+                #   input line  → from_wh set → consume (negative qty)
+                #   output line → to_wh set   → produce (positive qty at its rate)
+                # The cost-balance invariant (input value == output value) was already
+                # verified at draft, so the SLE pair nets to zero stock-value change.
+                if to_wh:
+                    sle_entries.append({
+                        "item_id": item["item_id"],
+                        "warehouse_id": to_wh,
+                        "actual_qty": str(round_currency(qty)),
+                        "incoming_rate": str(round_currency(rate)),
+                        "batch_id": item.get("batch_id"),
+                        "serial_number": item.get("serial_numbers"),
+                        "fiscal_year": fiscal_year,
+                        # The produced item must carry a stated value, never $0.
+                        "require_rate": True,
+                    })
+                else:
+                    sle_entries.append({
+                        "item_id": item["item_id"],
+                        "warehouse_id": from_wh,
+                        "actual_qty": str(round_currency(-qty)),
+                        "incoming_rate": "0",
+                        "batch_id": item.get("batch_id"),
+                        "serial_number": item.get("serial_numbers"),
+                        "fiscal_year": fiscal_year,
+                    })
+            elif entry_type == "send_to_subcontractor":
+                # Transfer OUT: negative at from_wh, positive at the subcontractor
+                # sub-store (to_wh was forced to the validated supplier warehouse at
+                # add time). The sub-store leg inherits the source valuation.
+                sle_entries.append({
+                    "item_id": item["item_id"],
+                    "warehouse_id": from_wh,
+                    "actual_qty": str(round_currency(-qty)),
+                    "incoming_rate": "0",
+                    "batch_id": item.get("batch_id"),
+                    "serial_number": item.get("serial_numbers"),
+                    "fiscal_year": fiscal_year,
+                })
+                sle_entries.append({
+                    "item_id": item["item_id"],
+                    "warehouse_id": to_wh,
+                    "actual_qty": str(round_currency(qty)),
+                    "incoming_rate": str(round_currency(rate)),
+                    "batch_id": item.get("batch_id"),
+                    "serial_number": item.get("serial_numbers"),
+                    "fiscal_year": fiscal_year,
+                })
+            elif entry_type == "material_consumption":
+                # Issue raw materials against the work order: negative at from_wh.
+                sle_entries.append({
+                    "item_id": item["item_id"],
+                    "warehouse_id": from_wh,
+                    "actual_qty": str(round_currency(-qty)),
+                    "incoming_rate": "0",
+                    "batch_id": item.get("batch_id"),
+                    "serial_number": item.get("serial_numbers"),
+                    "fiscal_year": fiscal_year,
+                })
 
-    # Hard-reservation enforcement (ADR-0026): a material_issue can never drive
-    # available stock below the sum of that warehouse's ACTIVE reservations for
-    # the item. available = actual_qty - SUM(active reserved_qty). Computed and
-    # blocked BEFORE any SLE is written (single-transaction; full rollback). This
-    # is what makes reservations "hard" rather than a cosmetic column.
-    if entry_type == "material_issue":
-        issue_per_key = {}  # (item_id, from_warehouse_id) -> total issue qty
-        for item_row in items:
-            il = row_to_dict(item_row)
-            key = (il["item_id"], il.get("from_warehouse_id"))
-            issue_per_key[key] = issue_per_key.get(key, Decimal("0")) + to_decimal(il["quantity"])
-        for (item_id, from_warehouse_id), issue_qty in issue_per_key.items():
-            if not from_warehouse_id:
-                continue
-            available = _available_qty(conn, item_id, from_warehouse_id)
-            if issue_qty > available:
-                err(f"Cannot issue {issue_qty} of item {item_id} from warehouse "
-                    f"{from_warehouse_id}: only {available} available (actual minus "
-                    f"active reservations). Release a reservation first.")
+        # Hard-reservation enforcement (ADR-0026): a material_issue can never drive
+        # available stock below the sum of that warehouse's ACTIVE reservations for
+        # the item. available = actual_qty - SUM(active reserved_qty). Computed and
+        # blocked BEFORE any SLE is written (single-transaction; full rollback). This
+        # is what makes reservations "hard" rather than a cosmetic column.
+        if entry_type == "material_issue":
+            issue_per_key = {}  # (item_id, from_warehouse_id) -> total issue qty
+            for item_row in items:
+                il = row_to_dict(item_row)
+                key = (il["item_id"], il.get("from_warehouse_id"))
+                issue_per_key[key] = issue_per_key.get(key, Decimal("0")) + to_decimal(il["quantity"])
+            for (item_id, from_warehouse_id), issue_qty in issue_per_key.items():
+                if not from_warehouse_id:
+                    continue
+                available = _available_qty(conn, item_id, from_warehouse_id)
+                if issue_qty > available:
+                    err(f"Cannot issue {issue_qty} of item {item_id} from warehouse "
+                        f"{from_warehouse_id}: only {available} available (actual minus "
+                        f"active reservations). Release a reservation first.")
 
-    # Insert SLE entries via shared lib
-    try:
-        sle_ids = insert_sle_entries(
-            conn, sle_entries,
-            voucher_type="stock_entry",
-            voucher_id=args.stock_entry_id,
-            posting_date=posting_date,
-            company_id=company_id,
-        )
-    except ValueError as e:
-        sys.stderr.write(f"[erpclaw-inventory] {e}\n")
-        err(f"SLE posting failed: {e}")
-
-    # Build SLE dicts with stock_value_difference for GL generation
-    sle_t = Table("stock_ledger_entry")
-    sle_q = (Q.from_(sle_t).select(sle_t.star)
-             .where(sle_t.voucher_type == "stock_entry")
-             .where(sle_t.voucher_id == P())
-             .where(sle_t.is_cancelled == 0))
-    sle_rows = conn.execute(sle_q.get_sql(), (args.stock_entry_id,)).fetchall()
-    sle_dicts = [row_to_dict(r) for r in sle_rows]
-
-    # Create perpetual inventory GL entries
-    try:
-        gl_entries = create_perpetual_inventory_gl(
-            conn, sle_dicts,
-            voucher_type="stock_entry",
-            voucher_id=args.stock_entry_id,
-            posting_date=posting_date,
-            company_id=company_id,
-            cost_center_id=cost_center_id,
-        )
-    except ValueError as e:
-        sys.stderr.write(f"[erpclaw-inventory] {e}\n")
-        err(f"GL posting failed: {e}")
-
-    gl_ids = []
-    if gl_entries:
-        # Add fiscal_year to each GL entry
-        for gle in gl_entries:
-            gle["fiscal_year"] = fiscal_year
+        # Insert SLE entries via shared lib
         try:
-            gl_ids = insert_gl_entries(
-                conn, gl_entries,
+            sle_ids = insert_sle_entries(
+                conn, sle_entries,
                 voucher_type="stock_entry",
                 voucher_id=args.stock_entry_id,
                 posting_date=posting_date,
                 company_id=company_id,
-                remarks=f"Stock Entry {se_dict['naming_series']}",
             )
+        except ValueError as e:
+            sys.stderr.write(f"[erpclaw-inventory] {e}\n")
+            err(f"SLE posting failed: {e}")
+
+        # Build SLE dicts with stock_value_difference for GL generation
+        sle_t = Table("stock_ledger_entry")
+        sle_q = (Q.from_(sle_t).select(sle_t.star)
+                 .where(sle_t.voucher_type == "stock_entry")
+                 .where(sle_t.voucher_id == P())
+                 .where(sle_t.is_cancelled == 0))
+        sle_rows = conn.execute(sle_q.get_sql(), (args.stock_entry_id,)).fetchall()
+        sle_dicts = [row_to_dict(r) for r in sle_rows]
+
+        # Create perpetual inventory GL entries
+        try:
+            if entry_type in INTERNAL_MOVE_TYPES:
+                gl_entries = _internal_transfer_gl_entries(
+                    conn, sle_dicts, company_id, cost_center_id)
+                if doc_dims:
+                    for leg in gl_entries:
+                        leg["dimensions"] = dict(doc_dims)
+            elif doc_dims:
+                gl_entries = create_perpetual_inventory_gl(
+                    conn, sle_dicts,
+                    voucher_type="stock_entry",
+                    voucher_id=args.stock_entry_id,
+                    posting_date=posting_date,
+                    company_id=company_id,
+                    cost_center_id=cost_center_id,
+                    dimensions=doc_dims,
+                )
+            else:
+                gl_entries = create_perpetual_inventory_gl(
+                    conn, sle_dicts,
+                    voucher_type="stock_entry",
+                    voucher_id=args.stock_entry_id,
+                    posting_date=posting_date,
+                    company_id=company_id,
+                    cost_center_id=cost_center_id,
+                )
         except ValueError as e:
             sys.stderr.write(f"[erpclaw-inventory] {e}\n")
             err(f"GL posting failed: {e}")
 
-    # Update status
-    conn.execute(
-        "UPDATE stock_entry SET status = 'submitted', updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) WHERE id = ?",
-        (args.stock_entry_id,),
-    )
+        gl_ids = []
+        if gl_entries:
+            # Add fiscal_year to each GL entry
+            for gle in gl_entries:
+                gle["fiscal_year"] = fiscal_year
+            try:
+                gl_ids = insert_gl_entries(
+                    conn, gl_entries,
+                    voucher_type="stock_entry",
+                    voucher_id=args.stock_entry_id,
+                    posting_date=posting_date,
+                    company_id=company_id,
+                    remarks=f"Stock Entry {se_dict['naming_series']}",
+                )
+            except ValueError as e:
+                sys.stderr.write(f"[erpclaw-inventory] {e}\n")
+                err(f"GL posting failed: {e}")
 
-    audit(conn, "erpclaw-inventory", "submit-stock-entry", "stock_entry", args.stock_entry_id,
-           new_values={"sle_count": len(sle_ids), "gl_count": len(gl_ids)})
-    conn.commit()
+        # Update status (compare-and-set: a concurrent submit wins, we refuse)
+        _flip = conn.execute(
+            "UPDATE stock_entry SET status = 'submitted', updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) WHERE id = ? AND status = 'draft'",
+            (args.stock_entry_id,),
+        )
+        if _flip.rowcount == 0:
+            conn.rollback()
+            _fresh = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
+            if not _fresh:
+                err(f"Stock entry {args.stock_entry_id} not found")
+            err(f"Cannot submit: stock entry is '{_fresh['status']}' (must be 'draft')")
+
+        audit(conn, "erpclaw-inventory", "submit-stock-entry", "stock_entry", args.stock_entry_id,
+               new_values={"sle_count": len(sle_ids), "gl_count": len(gl_ids)})
+        conn.commit()
+    except SystemExit:
+        conn.rollback()
+        raise
 
     ok({"stock_entry_id": args.stock_entry_id,
          "sle_entries_created": len(sle_ids),
@@ -1497,41 +2014,62 @@ def cancel_stock_entry(conn, args):
         err(f"Cannot cancel: stock entry is '{se['status']}' (must be 'submitted')",
              suggestion="Only submitted stock entries can be cancelled.")
 
-    posting_date = se["posting_date"]
-
-    # Reverse SLE entries
     try:
-        reversal_sle_ids = reverse_sle_entries(
-            conn,
-            voucher_type="stock_entry",
-            voucher_id=args.stock_entry_id,
-            posting_date=posting_date,
+        take_chain_heads(conn, [se["company_id"]])
+        se = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
+        if not se:
+            conn.rollback()
+            err(f"Stock entry {args.stock_entry_id} not found")
+        if se["status"] != "submitted":
+            conn.rollback()
+            err(f"Cannot cancel: stock entry is '{se['status']}' (must be 'submitted')",
+                 suggestion="Only submitted stock entries can be cancelled.")
+
+        posting_date = se["posting_date"]
+
+        # Reverse SLE entries
+        try:
+            reversal_sle_ids = reverse_sle_entries(
+                conn,
+                voucher_type="stock_entry",
+                voucher_id=args.stock_entry_id,
+                posting_date=posting_date,
+            )
+        except ValueError as e:
+            sys.stderr.write(f"[erpclaw-inventory] {e}\n")
+            err(f"SLE reversal failed: {e}")
+
+        # Reverse GL entries
+        try:
+            reversal_gl_ids = reverse_gl_entries(
+                conn,
+                voucher_type="stock_entry",
+                voucher_id=args.stock_entry_id,
+                posting_date=posting_date,
+            )
+        except ValueError:
+            # GL entries may not exist if perpetual inventory GL was skipped
+            reversal_gl_ids = []
+
+        # Update status (compare-and-set: a concurrent cancel wins, we refuse)
+        _flip = conn.execute(
+            "UPDATE stock_entry SET status = 'cancelled', updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) WHERE id = ? AND status = 'submitted'",
+            (args.stock_entry_id,),
         )
-    except ValueError as e:
-        sys.stderr.write(f"[erpclaw-inventory] {e}\n")
-        err(f"SLE reversal failed: {e}")
+        if _flip.rowcount == 0:
+            conn.rollback()
+            _fresh = conn.execute(se_q.get_sql(), (args.stock_entry_id,)).fetchone()
+            if not _fresh:
+                err(f"Stock entry {args.stock_entry_id} not found")
+            err(f"Cannot cancel: stock entry is '{_fresh['status']}' (must be 'submitted')",
+                 suggestion="Only submitted stock entries can be cancelled.")
 
-    # Reverse GL entries
-    try:
-        reversal_gl_ids = reverse_gl_entries(
-            conn,
-            voucher_type="stock_entry",
-            voucher_id=args.stock_entry_id,
-            posting_date=posting_date,
-        )
-    except ValueError:
-        # GL entries may not exist if perpetual inventory GL was skipped
-        reversal_gl_ids = []
-
-    # Update status
-    conn.execute(
-        "UPDATE stock_entry SET status = 'cancelled', updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) WHERE id = ?",
-        (args.stock_entry_id,),
-    )
-
-    audit(conn, "erpclaw-inventory", "cancel-stock-entry", "stock_entry", args.stock_entry_id,
-           new_values={"reversed": True})
-    conn.commit()
+        audit(conn, "erpclaw-inventory", "cancel-stock-entry", "stock_entry", args.stock_entry_id,
+               new_values={"reversed": True})
+        conn.commit()
+    except SystemExit:
+        conn.rollback()
+        raise
 
     ok({"stock_entry_id": args.stock_entry_id, "reversed": True,
          "sle_reversals": len(reversal_sle_ids),
@@ -1564,7 +2102,6 @@ def cancel_stock_entry(conn, args):
 # primitive with both legs and a DANGEROUS_ACTIONS gate rather than resurrecting
 # these.
 #
-# SIM: planning/simlogs/m103_SIM_2026-08-12.md
 # Pinned by tests/test_stock_gateways_retired.py (steer + nothing-lands) and
 # testing/unit/constitution/test_stock_entry_ties_to_the_books.py (INV-24 floor).
 # ---------------------------------------------------------------------------
@@ -1609,6 +2146,29 @@ def reverse_stock_ledger_entries(conn, args):
 # 17. get-stock-balance
 # ---------------------------------------------------------------------------
 
+def _warehouse_company_guard(conn, args, warehouse_id):
+    """Return the company that owns a warehouse, enforcing an explicit scope.
+
+    When the caller passes --company-id or --company the company must exist
+    (resolve_scope_company refuses otherwise) and the warehouse must belong
+    to it. With no company argument the warehouse's own company is returned
+    and no refusal is possible: a warehouse anchors the scope.
+    """
+    given_id = getattr(args, "company_id", None)
+    given_name = getattr(args, "company_name", None)
+    scope_company = None
+    if given_id or given_name:
+        scope_company = resolve_scope_company(conn, given_id, given_name)
+    w = Table("warehouse")
+    q = Q.from_(w).select(w.company_id).where(w.id == P())
+    row = conn.execute(q.get_sql(), [warehouse_id]).fetchone()
+    if not row:
+        err(f"Warehouse {warehouse_id} not found")
+    if scope_company is not None and row["company_id"] != scope_company:
+        err(f"Warehouse {warehouse_id} belongs to another company")
+    return row["company_id"]
+
+
 def get_stock_balance_action(conn, args):
     """Get stock balance for an item in a warehouse."""
     if not args.item_id:
@@ -1616,6 +2176,7 @@ def get_stock_balance_action(conn, args):
     if not args.warehouse_id:
         err("--warehouse-id is required")
 
+    _warehouse_company_guard(conn, args, args.warehouse_id)
     balance = get_stock_balance(conn, args.item_id, args.warehouse_id)
     ok({"item_id": args.item_id, "warehouse_id": args.warehouse_id,
          "qty": balance["qty"], "valuation_rate": balance["valuation_rate"],
@@ -1662,8 +2223,8 @@ def stock_balance_report(conn, args):
            JOIN item i ON i.id = sle.item_id
            JOIN warehouse w ON w.id = sle.warehouse_id
            WHERE {where}
-           GROUP BY sle.item_id, sle.warehouse_id
-           HAVING decimal_sum(sle.actual_qty) + 0 != 0
+           GROUP BY sle.item_id, sle.warehouse_id, i.item_code, i.item_name, w.name
+           HAVING CAST(decimal_sum(sle.actual_qty) AS NUMERIC) != 0
            ORDER BY i.item_name, w.name""",
         params,
     ).fetchall()
@@ -1696,6 +2257,10 @@ def stock_balance_report(conn, args):
 
 def stock_ledger_report(conn, args):
     """Stock ledger entry detail report."""
+    if getattr(args, "warehouse_id", None) and not (getattr(args, "company_id", None) or getattr(args, "company_name", None)):
+        company_id = None
+    else:
+        company_id = resolve_scope_company(conn, getattr(args, "company_id", None), getattr(args, "company_name", None))
     sle = Table("stock_ledger_entry").as_("sle")
     i = Table("item").as_("i")
     w = Table("warehouse").as_("w")
@@ -1723,8 +2288,11 @@ def stock_ledger_report(conn, args):
         rows_q = rows_q.where(sle.posting_date <= P())
         params.append(args.to_date)
 
-    limit = int(args.limit) if args.limit else 100
-    offset = int(args.offset) if args.offset else 0
+    if company_id is not None:
+        rows_q = rows_q.where(w.company_id == P())
+        params.append(company_id)
+
+    limit, offset = _parse_paging(args, default_limit=100)
     params.extend([limit, offset])
 
     rows = conn.execute(rows_q.get_sql(), params).fetchall()
@@ -1778,8 +2346,7 @@ def add_batch(conn, args):
 
 def list_batches(conn, args):
     """List batches with optional filters."""
-    limit = int(args.limit) if args.limit else 20
-    offset = int(args.offset) if args.offset else 0
+    limit, offset = _parse_paging(args)
 
     if args.warehouse_id:
         # Filter by batches that have stock in the specified warehouse
@@ -1798,7 +2365,7 @@ def list_batches(conn, args):
                    JOIN stock_ledger_entry sle ON sle.batch_id = b.id
                    WHERE {where} AND sle.warehouse_id = ? AND sle.is_cancelled = 0
                    GROUP BY b.id
-                   HAVING decimal_sum(sle.actual_qty) + 0 > 0
+                   HAVING CAST(decimal_sum(sle.actual_qty) AS NUMERIC) > 0
                )""",
             params + [args.warehouse_id],
         ).fetchone()
@@ -1810,7 +2377,7 @@ def list_batches(conn, args):
                JOIN stock_ledger_entry sle ON sle.batch_id = b.id
                WHERE {where} AND sle.warehouse_id = ? AND sle.is_cancelled = 0
                GROUP BY b.id
-               HAVING decimal_sum(sle.actual_qty) + 0 > 0
+               HAVING CAST(decimal_sum(sle.actual_qty) AS NUMERIC) > 0
                ORDER BY b.batch_name
                LIMIT ? OFFSET ?""",
             params + [args.warehouse_id, limit, offset],
@@ -1914,8 +2481,7 @@ def list_serial_numbers(conn, args):
     count_row = conn.execute(count_q.get_sql(), count_params).fetchone()
     total_count = count_row[0]
 
-    limit = int(args.limit) if args.limit else 20
-    offset = int(args.offset) if args.offset else 0
+    limit, offset = _parse_paging(args)
 
     rows_q = (Q.from_(sn)
               .left_join(i).on(i.id == sn.item_id)
@@ -2118,6 +2684,14 @@ def add_stock_reconciliation(conn, args):
     if not conn.execute(co_q.get_sql(), (args.company_id,)).fetchone():
         err(f"Company {args.company_id} not found")
 
+    dims_obj = _parse_stock_dimensions(args)
+    if dims_obj:
+        try:
+            validate_document_dimensions(conn, dims_obj)
+        except ValueError as e:
+            err(str(e))
+    dims_text = dimensions_json_text(dims_obj)
+
     items = _parse_json_arg(args.items, "items")
     if not items or not isinstance(items, list):
         err("--items must be a non-empty JSON array")
@@ -2163,12 +2737,13 @@ def add_stock_reconciliation(conn, args):
     sr_t = Table("stock_reconciliation")
     sr_q = Q.into(sr_t).columns(
         "id", "naming_series", "posting_date", "difference_amount",
-        "status", "company_id",
-    ).insert(P(), P(), P(), P(), "draft", P())
+        "status", "company_id", "dimensions_json",
+    ).insert(P(), P(), P(), P(), "draft", P(), P())
     conn.execute(
         sr_q.get_sql(),
         (sr_id, naming, args.posting_date,
-         str(round_currency(total_diff_amount)), args.company_id),
+         str(round_currency(total_diff_amount)), args.company_id,
+         dims_text),
     )
 
     # Now insert child stock_reconciliation_item rows
@@ -2207,114 +2782,152 @@ def submit_stock_reconciliation(conn, args):
     if sr["status"] != "draft":
         err(f"Cannot submit: reconciliation is '{sr['status']}' (must be 'draft')")
 
-    sr_dict = row_to_dict(sr)
-    company_id = sr_dict["company_id"]
-    posting_date = sr_dict["posting_date"]
+    try:
+        take_chain_heads(conn, [sr["company_id"]])
+        sr = conn.execute(sr_q.get_sql(), (args.stock_reconciliation_id,)).fetchone()
+        if not sr:
+            conn.rollback()
+            err(f"Stock reconciliation {args.stock_reconciliation_id} not found")
+        if sr["status"] != "draft":
+            conn.rollback()
+            err(f"Cannot submit: reconciliation is '{sr['status']}' (must be 'draft')")
 
-    # Fetch reconciliation items
-    sri_t = Table("stock_reconciliation_item")
-    sri_q = (Q.from_(sri_t).select(sri_t.star)
-             .where(sri_t.stock_reconciliation_id == P()))
-    sri_rows = conn.execute(sri_q.get_sql(), (args.stock_reconciliation_id,)).fetchall()
-    if not sri_rows:
-        err("Stock reconciliation has no items")
-
-    fiscal_year = _get_fiscal_year(conn, posting_date)
-    cost_center_id = _get_cost_center(conn, company_id)
-
-    # Build SLE entries for quantity differences
-    sle_entries = []
-    for sri in sri_rows:
-        item = row_to_dict(sri)
-        qty_diff = to_decimal(item["quantity_difference"])
-        if qty_diff == 0:
-            continue
-
-        valuation_rate = to_decimal(item["valuation_rate"])
-        sle_entries.append({
-            "item_id": item["item_id"],
-            "warehouse_id": item["warehouse_id"],
-            "actual_qty": str(round_currency(qty_diff)),
-            "incoming_rate": str(round_currency(valuation_rate)) if qty_diff > 0 else "0",
-            "fiscal_year": fiscal_year,
-        })
-
-    sle_ids = []
-    if sle_entries:
-        try:
-            sle_ids = insert_sle_entries(
-                conn, sle_entries,
-                voucher_type="stock_reconciliation",
-                voucher_id=args.stock_reconciliation_id,
-                posting_date=posting_date,
-                company_id=company_id,
-            )
-        except ValueError as e:
-            sys.stderr.write(f"[erpclaw-inventory] {e}\n")
-            err(f"SLE posting failed: {e}")
-
-    # Build GL entries for value adjustments
-    gl_ids = []
-    if sle_ids:
-        sle_rows_t = Table("stock_ledger_entry")
-        sle_rows_q = (Q.from_(sle_rows_t).select(sle_rows_t.star)
-                      .where(sle_rows_t.voucher_type == "stock_reconciliation")
-                      .where(sle_rows_t.voucher_id == P())
-                      .where(sle_rows_t.is_cancelled == 0))
-        sle_rows = conn.execute(sle_rows_q.get_sql(), (args.stock_reconciliation_id,)).fetchall()
-        sle_dicts = [row_to_dict(r) for r in sle_rows]
-
-        # Find stock adjustment account as contra for reconciliation
-        # Uses account_type filter — kept as PyPika
-        acct_t = Table("account")
-        acct_q = (Q.from_(acct_t).select(acct_t.id)
-                  .where(acct_t.account_type == "stock_adjustment")
-                  .where(acct_t.company_id == P())
-                  .where(acct_t.is_group == 0)
-                  .limit(1))
-        stock_adj_acct = conn.execute(acct_q.get_sql(), (company_id,)).fetchone()
-        expense_account_id = stock_adj_acct["id"] if stock_adj_acct else None
+        sr_dict = row_to_dict(sr)
+        company_id = sr_dict["company_id"]
+        posting_date = sr_dict["posting_date"]
 
         try:
-            gl_entries = create_perpetual_inventory_gl(
-                conn, sle_dicts,
-                voucher_type="stock_reconciliation",
-                voucher_id=args.stock_reconciliation_id,
-                posting_date=posting_date,
-                company_id=company_id,
-                expense_account_id=expense_account_id,
-                cost_center_id=cost_center_id,
-            )
-        except ValueError as e:
-            sys.stderr.write(f"[erpclaw-inventory] {e}\n")
-            err(f"GL posting failed: {e}")
+            doc_dims = json.loads(sr_dict.get("dimensions_json") or "{}")
+        except ValueError:
+            err("Stored dimensions are not valid JSON; re-create the document")
+        if not isinstance(doc_dims, dict):
+            err("Stored dimensions are not a JSON object; re-create the document")
 
-        if gl_entries:
-            for gle in gl_entries:
-                gle["fiscal_year"] = fiscal_year
+        # Fetch reconciliation items
+        sri_t = Table("stock_reconciliation_item")
+        sri_q = (Q.from_(sri_t).select(sri_t.star)
+                 .where(sri_t.stock_reconciliation_id == P()))
+        sri_rows = conn.execute(sri_q.get_sql(), (args.stock_reconciliation_id,)).fetchall()
+        if not sri_rows:
+            err("Stock reconciliation has no items")
+
+        fiscal_year = get_fiscal_year(conn, posting_date, company_id=sr_dict["company_id"])
+        cost_center_id = doc_dims.get("cost_center") or _get_cost_center(conn, company_id)
+
+        # Build SLE entries for quantity differences
+        sle_entries = []
+        for sri in sri_rows:
+            item = row_to_dict(sri)
+            qty_diff = to_decimal(item["quantity_difference"])
+            if qty_diff == 0:
+                continue
+
+            valuation_rate = to_decimal(item["valuation_rate"])
+            sle_entries.append({
+                "item_id": item["item_id"],
+                "warehouse_id": item["warehouse_id"],
+                "actual_qty": str(round_currency(qty_diff)),
+                "incoming_rate": str(round_currency(valuation_rate)) if qty_diff > 0 else "0",
+                "fiscal_year": fiscal_year,
+            })
+
+        sle_ids = []
+        if sle_entries:
             try:
-                gl_ids = insert_gl_entries(
-                    conn, gl_entries,
+                sle_ids = insert_sle_entries(
+                    conn, sle_entries,
                     voucher_type="stock_reconciliation",
                     voucher_id=args.stock_reconciliation_id,
                     posting_date=posting_date,
                     company_id=company_id,
-                    remarks=f"Stock Reconciliation {sr_dict['naming_series']}",
                 )
+            except ValueError as e:
+                sys.stderr.write(f"[erpclaw-inventory] {e}\n")
+                err(f"SLE posting failed: {e}")
+
+        # Build GL entries for value adjustments
+        gl_ids = []
+        if sle_ids:
+            sle_rows_t = Table("stock_ledger_entry")
+            sle_rows_q = (Q.from_(sle_rows_t).select(sle_rows_t.star)
+                          .where(sle_rows_t.voucher_type == "stock_reconciliation")
+                          .where(sle_rows_t.voucher_id == P())
+                          .where(sle_rows_t.is_cancelled == 0))
+            sle_rows = conn.execute(sle_rows_q.get_sql(), (args.stock_reconciliation_id,)).fetchall()
+            sle_dicts = [row_to_dict(r) for r in sle_rows]
+
+            # Find stock adjustment account as contra for reconciliation
+            # Uses account_type filter — kept as PyPika
+            acct_t = Table("account")
+            acct_q = (Q.from_(acct_t).select(acct_t.id)
+                      .where(acct_t.account_type == "stock_adjustment")
+                      .where(acct_t.company_id == P())
+                      .where(acct_t.is_group == 0)
+                      .limit(1))
+            stock_adj_acct = conn.execute(acct_q.get_sql(), (company_id,)).fetchone()
+            expense_account_id = stock_adj_acct["id"] if stock_adj_acct else None
+
+            try:
+                if doc_dims:
+                    gl_entries = create_perpetual_inventory_gl(
+                        conn, sle_dicts,
+                        voucher_type="stock_reconciliation",
+                        voucher_id=args.stock_reconciliation_id,
+                        posting_date=posting_date,
+                        company_id=company_id,
+                        expense_account_id=expense_account_id,
+                        cost_center_id=cost_center_id,
+                        dimensions=doc_dims,
+                    )
+                else:
+                    gl_entries = create_perpetual_inventory_gl(
+                        conn, sle_dicts,
+                        voucher_type="stock_reconciliation",
+                        voucher_id=args.stock_reconciliation_id,
+                        posting_date=posting_date,
+                        company_id=company_id,
+                        expense_account_id=expense_account_id,
+                        cost_center_id=cost_center_id,
+                    )
             except ValueError as e:
                 sys.stderr.write(f"[erpclaw-inventory] {e}\n")
                 err(f"GL posting failed: {e}")
 
-    # Update status
-    conn.execute(
-        "UPDATE stock_reconciliation SET status = 'submitted', updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) WHERE id = ?",
-        (args.stock_reconciliation_id,),
-    )
+            if gl_entries:
+                for gle in gl_entries:
+                    gle["fiscal_year"] = fiscal_year
+                try:
+                    gl_ids = insert_gl_entries(
+                        conn, gl_entries,
+                        voucher_type="stock_reconciliation",
+                        voucher_id=args.stock_reconciliation_id,
+                        posting_date=posting_date,
+                        company_id=company_id,
+                        remarks=f"Stock Reconciliation {sr_dict['naming_series']}",
+                    )
+                except ValueError as e:
+                    sys.stderr.write(f"[erpclaw-inventory] {e}\n")
+                    err(f"GL posting failed: {e}")
 
-    audit(conn, "erpclaw-inventory", "submit-stock-reconciliation", "stock_reconciliation",
-           args.stock_reconciliation_id,
-           new_values={"sle_count": len(sle_ids), "gl_count": len(gl_ids)})
-    conn.commit()
+        # Update status (compare-and-set: a concurrent submit wins, we refuse)
+        _flip = conn.execute(
+            "UPDATE stock_reconciliation SET status = 'submitted', updated_at = CAST(CURRENT_TIMESTAMP AS TEXT) WHERE id = ? AND status = 'draft'",
+            (args.stock_reconciliation_id,),
+        )
+        if _flip.rowcount == 0:
+            conn.rollback()
+            _fresh = conn.execute(sr_q.get_sql(), (args.stock_reconciliation_id,)).fetchone()
+            if not _fresh:
+                err(f"Stock reconciliation {args.stock_reconciliation_id} not found")
+            err(f"Cannot submit: reconciliation is '{_fresh['status']}' (must be 'draft')")
+
+        audit(conn, "erpclaw-inventory", "submit-stock-reconciliation", "stock_reconciliation",
+               args.stock_reconciliation_id,
+               new_values={"sle_count": len(sle_ids), "gl_count": len(gl_ids)})
+        conn.commit()
+    except SystemExit:
+        conn.rollback()
+        raise
 
     ok({"stock_reconciliation_id": args.stock_reconciliation_id,
          "sle_entries_created": len(sle_ids),
@@ -2379,6 +2992,14 @@ def revalue_stock(conn, args):
         err(f"Warehouse {warehouse_id} not found")
     company_id = wh_row["company_id"]
 
+    dims_obj = _parse_stock_dimensions(args)
+    if dims_obj:
+        try:
+            validate_document_dimensions(conn, dims_obj)
+        except ValueError as e:
+            err(str(e))
+    dims_text = dimensions_json_text(dims_obj)
+
     # Get current stock balance
     balance = get_stock_balance(conn, item_id, warehouse_id)
     current_qty = to_decimal(balance["qty"])
@@ -2392,134 +3013,173 @@ def revalue_stock(conn, args):
     if new_rate_d == old_rate_d:
         err(f"New rate ({new_rate_d}) is the same as current rate ({old_rate_d}). No revaluation needed.")
 
-    # Compute adjustment
-    new_value = round_currency(current_qty * new_rate_d)
-    adjustment = round_currency(new_value - old_value)
+    try:
+        take_chain_heads(conn, [company_id])
 
-    fiscal_year = _get_fiscal_year(conn, posting_date)
-    cost_center_id = _get_cost_center(conn, company_id)
+        # Re-read under the head: the same selects, decided afresh.
+        item_row = conn.execute(item_q.get_sql(), (item_id,)).fetchone()
+        if not item_row:
+            conn.rollback()
+            err(f"Item {item_id} not found")
+        if not item_row["is_stock_item"]:
+            conn.rollback()
+            err(f"Item {item_row['item_name']} is not a stock item")
 
-    # Generate IDs
-    reval_id = str(uuid.uuid4())
+        wh_row = conn.execute(wh_q.get_sql(), (warehouse_id,)).fetchone()
+        if not wh_row:
+            conn.rollback()
+            err(f"Warehouse {warehouse_id} not found")
+        company_id = wh_row["company_id"]
 
-    # Naming series
-    naming = get_next_name(conn, "stock_revaluation", company_id=company_id)
+        # Re-read the stock balance under the head and re-run its refusals.
+        balance = get_stock_balance(conn, item_id, warehouse_id)
+        current_qty = to_decimal(balance["qty"])
+        old_rate_d = to_decimal(balance["valuation_rate"])
+        old_value = to_decimal(balance["stock_value"])
 
-    # --- Single atomic transaction ---
+        if current_qty <= 0:
+            conn.rollback()
+            err(f"Cannot revalue: no stock on hand for item '{item_row['item_name']}' "
+                f"in warehouse '{wh_row['name']}' (qty={current_qty})")
 
-    # 1. Insert the zero-qty valuation SLE row through the shared repricing helper.
-    # For moving-average items this is byte-identical to the historical inline
-    # INSERT; for FIFO items the helper ALSO resets the open layer rates to the new
-    # rate (R1: revaluation previously skipped FIFO layers, so FIFO stock kept
-    # consuming at stale costs). The GL side is unchanged and posted below.
-    reprice_stock_valuation(
-        conn, item_id, warehouse_id,
-        voucher_type="stock_revaluation",
-        voucher_id=reval_id,
-        posting_date=posting_date,
-        new_rate=str(new_rate_d),
-        fiscal_year=fiscal_year,
-    )
+        if new_rate_d == old_rate_d:
+            conn.rollback()
+            err(f"New rate ({new_rate_d}) is the same as current rate ({old_rate_d}). No revaluation needed.")
 
-    # 2. Create GL entries for the value adjustment
-    gl_ids = []
-    if adjustment != 0:
-        # Stock-in-Hand account (from warehouse)
-        warehouse_account_id = wh_row["account_id"]
-        if not warehouse_account_id:
-            stock_acct_t = Table("account")
-            stock_acct_q = (Q.from_(stock_acct_t).select(stock_acct_t.id)
-                            .where(stock_acct_t.account_type == "stock")
-                            .where(stock_acct_t.company_id == P())
-                            .where(stock_acct_t.is_group == 0)
-                            .limit(1))
-            stock_acct = conn.execute(stock_acct_q.get_sql(), (company_id,)).fetchone()
-            warehouse_account_id = stock_acct["id"] if stock_acct else None
+        # Compute adjustment from the re-read values.
+        new_value = round_currency(current_qty * new_rate_d)
+        adjustment = round_currency(new_value - old_value)
 
-        # Stock Adjustment account (contra)
-        adj_acct_t = Table("account")
-        adj_acct_q = (Q.from_(adj_acct_t).select(adj_acct_t.id)
-                      .where(adj_acct_t.account_type == "stock_adjustment")
-                      .where(adj_acct_t.company_id == P())
-                      .where(adj_acct_t.is_group == 0)
-                      .limit(1))
-        stock_adj_acct = conn.execute(adj_acct_q.get_sql(), (company_id,)).fetchone()
-        stock_adj_account_id = stock_adj_acct["id"] if stock_adj_acct else None
+        fiscal_year = get_fiscal_year(conn, posting_date, company_id=wh_row["company_id"])
+        cost_center_id = (dims_obj or {}).get("cost_center") or _get_cost_center(conn, company_id)
 
-        if warehouse_account_id and stock_adj_account_id:
-            abs_adj = abs(adjustment)
-            gl_entries = []
-            if adjustment > 0:
-                # Rate increased: DR Stock-in-Hand, CR Stock Adjustment
-                gl_entries.append({
-                    "account_id": warehouse_account_id,
-                    "debit": str(round_currency(abs_adj)),
-                    "credit": "0",
-                })
-                gl_entries.append({
-                    "account_id": stock_adj_account_id,
-                    "debit": "0",
-                    "credit": str(round_currency(abs_adj)),
-                    "cost_center_id": cost_center_id,
-                })
-            else:
-                # Rate decreased: DR Stock Adjustment, CR Stock-in-Hand
-                gl_entries.append({
-                    "account_id": stock_adj_account_id,
-                    "debit": str(round_currency(abs_adj)),
-                    "credit": "0",
-                    "cost_center_id": cost_center_id,
-                })
-                gl_entries.append({
-                    "account_id": warehouse_account_id,
-                    "debit": "0",
-                    "credit": str(round_currency(abs_adj)),
-                })
+        # Generate IDs
+        reval_id = str(uuid.uuid4())
 
-            for gle in gl_entries:
-                gle["fiscal_year"] = fiscal_year
+        # Naming series
+        naming = get_next_name(conn, "stock_revaluation", company_id=company_id)
 
-            try:
-                gl_ids = insert_gl_entries(
-                    conn, gl_entries,
-                    voucher_type="stock_revaluation",
-                    voucher_id=reval_id,
-                    posting_date=posting_date,
-                    company_id=company_id,
-                    remarks=f"Stock Revaluation {naming}: "
-                            f"{item_row['item_name']} rate {old_rate_d} → {new_rate_d}",
-                )
-            except ValueError as e:
-                sys.stderr.write(f"[erpclaw-inventory] GL posting failed: {e}\n")
-                err(f"GL posting failed: {e}")
+        # 1. Insert the zero-qty valuation SLE row through the shared repricing helper.
+        # For moving-average items this is byte-identical to the historical inline
+        # INSERT; for FIFO items the helper ALSO resets the open layer rates to the new
+        # rate (R1: revaluation previously skipped FIFO layers, so FIFO stock kept
+        # consuming at stale costs). The GL side is unchanged and posted below.
+        reprice_stock_valuation(
+            conn, item_id, warehouse_id,
+            voucher_type="stock_revaluation",
+            voucher_id=reval_id,
+            posting_date=posting_date,
+            new_rate=str(new_rate_d),
+            fiscal_year=fiscal_year,
+        )
 
-    # 3. Insert stock_revaluation record
-    # Uses CAST(CURRENT_TIMESTAMP AS TEXT) for created_at and updated_at — kept as raw SQL
-    conn.execute(
-        """INSERT INTO stock_revaluation (
-            id, naming_series, company_id, item_id, warehouse_id,
-            posting_date, current_qty, old_rate, new_rate,
-            adjustment_amount, reason, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted',
-                  CAST(CURRENT_TIMESTAMP AS TEXT), CAST(CURRENT_TIMESTAMP AS TEXT))""",
-        (
-            reval_id, naming, company_id, item_id, warehouse_id,
-            posting_date,
-            str(round_currency(current_qty)),
-            str(round_currency(old_rate_d)),
-            str(round_currency(new_rate_d)),
-            str(adjustment),
-            reason,
-        ),
-    )
+        # 2. Create GL entries for the value adjustment
+        gl_ids = []
+        if adjustment != 0:
+            # Stock-in-Hand account (from warehouse)
+            warehouse_account_id = wh_row["account_id"]
+            if not warehouse_account_id:
+                stock_acct_t = Table("account")
+                stock_acct_q = (Q.from_(stock_acct_t).select(stock_acct_t.id)
+                                .where(stock_acct_t.account_type == "stock")
+                                .where(stock_acct_t.company_id == P())
+                                .where(stock_acct_t.is_group == 0)
+                                .limit(1))
+                stock_acct = conn.execute(stock_acct_q.get_sql(), (company_id,)).fetchone()
+                warehouse_account_id = stock_acct["id"] if stock_acct else None
 
-    audit(conn, "erpclaw-inventory", "revalue-stock", "stock_revaluation",
-          reval_id, new_values={
-              "item_id": item_id, "warehouse_id": warehouse_id,
-              "old_rate": str(old_rate_d), "new_rate": str(new_rate_d),
-              "adjustment": str(adjustment), "gl_count": len(gl_ids),
-          })
-    conn.commit()
+            # Stock Adjustment account (contra)
+            adj_acct_t = Table("account")
+            adj_acct_q = (Q.from_(adj_acct_t).select(adj_acct_t.id)
+                          .where(adj_acct_t.account_type == "stock_adjustment")
+                          .where(adj_acct_t.company_id == P())
+                          .where(adj_acct_t.is_group == 0)
+                          .limit(1))
+            stock_adj_acct = conn.execute(adj_acct_q.get_sql(), (company_id,)).fetchone()
+            stock_adj_account_id = stock_adj_acct["id"] if stock_adj_acct else None
+
+            if warehouse_account_id and stock_adj_account_id:
+                abs_adj = abs(adjustment)
+                gl_entries = []
+                if adjustment > 0:
+                    # Rate increased: DR Stock-in-Hand, CR Stock Adjustment
+                    gl_entries.append({
+                        "account_id": warehouse_account_id,
+                        "debit": str(round_currency(abs_adj)),
+                        "credit": "0",
+                    })
+                    gl_entries.append({
+                        "account_id": stock_adj_account_id,
+                        "debit": "0",
+                        "credit": str(round_currency(abs_adj)),
+                        "cost_center_id": cost_center_id,
+                    })
+                else:
+                    # Rate decreased: DR Stock Adjustment, CR Stock-in-Hand
+                    gl_entries.append({
+                        "account_id": stock_adj_account_id,
+                        "debit": str(round_currency(abs_adj)),
+                        "credit": "0",
+                        "cost_center_id": cost_center_id,
+                    })
+                    gl_entries.append({
+                        "account_id": warehouse_account_id,
+                        "debit": "0",
+                        "credit": str(round_currency(abs_adj)),
+                    })
+
+                if dims_obj:
+                    for gle in gl_entries:
+                        gle["dimensions"] = dict(dims_obj)
+
+                for gle in gl_entries:
+                    gle["fiscal_year"] = fiscal_year
+
+                try:
+                    gl_ids = insert_gl_entries(
+                        conn, gl_entries,
+                        voucher_type="stock_revaluation",
+                        voucher_id=reval_id,
+                        posting_date=posting_date,
+                        company_id=company_id,
+                        remarks=f"Stock Revaluation {naming}: "
+                                f"{item_row['item_name']} rate {old_rate_d} → {new_rate_d}",
+                    )
+                except ValueError as e:
+                    sys.stderr.write(f"[erpclaw-inventory] GL posting failed: {e}\n")
+                    err(f"GL posting failed: {e}")
+
+        # 3. Insert stock_revaluation record
+        # Uses CAST(CURRENT_TIMESTAMP AS TEXT) for created_at and updated_at — kept as raw SQL
+        conn.execute(
+            """INSERT INTO stock_revaluation (
+                id, naming_series, company_id, item_id, warehouse_id,
+                posting_date, current_qty, old_rate, new_rate,
+                adjustment_amount, reason, dimensions_json, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'submitted',
+                      CAST(CURRENT_TIMESTAMP AS TEXT), CAST(CURRENT_TIMESTAMP AS TEXT))""",
+            (
+                reval_id, naming, company_id, item_id, warehouse_id,
+                posting_date,
+                str(round_currency(current_qty)),
+                str(round_currency(old_rate_d)),
+                str(round_currency(new_rate_d)),
+                str(adjustment),
+                reason,
+                dims_text,
+            ),
+        )
+
+        audit(conn, "erpclaw-inventory", "revalue-stock", "stock_revaluation",
+              reval_id, new_values={
+                  "item_id": item_id, "warehouse_id": warehouse_id,
+                  "old_rate": str(old_rate_d), "new_rate": str(new_rate_d),
+                  "adjustment": str(adjustment), "gl_count": len(gl_ids),
+              })
+        conn.commit()
+    except SystemExit:
+        conn.rollback()
+        raise
 
     ok({
         "revaluation_id": reval_id,
@@ -2545,8 +3205,7 @@ def list_stock_revaluations(conn, args):
                                     getattr(args, 'company_id', None),
                                     getattr(args, 'company_name', None))
 
-    limit = int(args.limit or "20")
-    offset = int(args.offset or "0")
+    limit, offset = _parse_paging(args)
 
     sr = Table("stock_revaluation").as_("sr")
     i = Table("item").as_("i")
@@ -2740,6 +3399,8 @@ def status_action(conn, args):
 
 def check_reorder(conn, args):
     """Find items whose current stock is at or below their reorder level."""
+    if getattr(args, "reorder_rules", None) is not None:
+        return _check_warehouse_reorder_rules(conn, args)
     company_id = resolve_company_id(conn,
                                     getattr(args, 'company_id', None),
                                     getattr(args, 'company_name', None))
@@ -2791,6 +3452,430 @@ def check_reorder(conn, args):
     ok({
         "items_below_reorder": len(results),
         "items": results,
+    })
+
+
+def _reorder_quantity(raw, field):
+    """Rule quantities are exact nonnegative text, with six-place precision."""
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        err(f"{field} must be an exact non-negative quantity, supplied as text")
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, ValueError):
+        err(f"{field} must be an exact non-negative quantity, supplied as text")
+    if (not value.is_finite() or value < 0 or value > Decimal("1000000000000000000")
+            or value.as_tuple().exponent < -6):
+        err(f"{field} must be non-negative, at most 10^18, with at most six decimal places")
+    return value
+
+
+def _check_warehouse_reorder_rules(conn, args):
+    """Evaluate caller-managed warehouse rules without saving review state."""
+    company = getattr(args, "company_id", None)
+    company_name = getattr(args, "company_name", None)
+    if not company and not company_name:
+        err("--company-id is required for warehouse reorder rules")
+    company = resolve_scope_company(conn, company, company_name)
+    as_of = _parse_demand_date(getattr(args, "as_of_date", None), "--as-of-date")
+    rules = _parse_json_arg(args.reorder_rules, "reorder-rules")
+    if not isinstance(rules, list) or not 1 <= len(rules) <= 100:
+        err("--reorder-rules must contain between 1 and 100 rule objects")
+    allowed = {"item_id", "warehouse_id", "min_qty", "max_qty", "trigger",
+               "interval_days", "horizon_days", "history_days", "last_review_date"}
+    results = []
+    seen = set()
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) - allowed:
+            err("Each reorder rule must be an object with only documented fields")
+        item_id = rule.get("item_id")
+        warehouse_id = rule.get("warehouse_id")
+        if any(not isinstance(value, str) or not value.strip() or len(value) > 200
+               for value in (item_id, warehouse_id)):
+            err("Each reorder rule needs item_id and warehouse_id")
+        key = (item_id, warehouse_id)
+        if key in seen:
+            err("Duplicate item and warehouse reorder rule")
+        seen.add(key)
+        minimum = _reorder_quantity(rule.get("min_qty"), "min_qty")
+        maximum = _reorder_quantity(rule.get("max_qty"), "max_qty")
+        if maximum < minimum:
+            err("max_qty must not be less than min_qty")
+        trigger = rule.get("trigger", "stock")
+        if trigger not in ("stock", "forecast"):
+            err("trigger must be stock or forecast")
+        interval = _parse_demand_days(rule.get("interval_days"), "interval_days")
+        horizon = _parse_demand_days(rule.get("horizon_days"), "horizon_days")
+        history = _parse_demand_days(rule.get("history_days", 30), "history_days")
+        last_review = rule.get("last_review_date")
+        if last_review is not None:
+            last_review = _parse_demand_date(last_review, "last_review_date")
+            if last_review > as_of:
+                err("last_review_date must not be later than --as-of-date")
+        try:
+            due_date = last_review + timedelta(days=interval) if last_review else as_of
+            due = as_of >= due_date
+            next_review = as_of + timedelta(days=interval) if due else due_date
+            history_start = as_of - timedelta(days=history - 1)
+        except OverflowError:
+            err("Review or history window exceeds the supported calendar")
+
+        item = Table("item")
+        item_q = (Q.from_(item).select(item.item_code, item.item_name)
+                  .where(item.id == P()).where(item.status == P())
+                  .where(item.is_stock_item == 1))
+        found = conn.execute(item_q.get_sql(), (item_id, "active")).fetchone()
+        if not found:
+            err(f"Active stock item {item_id} not found")
+        wh = Table("warehouse")
+        wh_q = (Q.from_(wh).select(wh.id).where(wh.id == P())
+                .where(wh.company_id == P()).where(wh.is_group == 0))
+        if not conn.execute(wh_q.get_sql(), (warehouse_id, company)).fetchone():
+            err(f"Warehouse {warehouse_id} is not a leaf store for this company")
+        sle = Table("stock_ledger_entry")
+        rows_q = (Q.from_(sle).join(wh).on(wh.id == sle.warehouse_id)
+                  .select(sle.actual_qty, sle.posting_date)
+                  .where(wh.company_id == P()).where(sle.item_id == P())
+                  .where(sle.warehouse_id == P()).where(sle.is_cancelled == 0)
+                  .where(sle.posting_date <= P()))
+        rows = conn.execute(rows_q.get_sql(),
+                            (company, item_id, warehouse_id, as_of.isoformat())).fetchall()
+        with localcontext() as ctx:
+            ctx.prec = 50
+            stock = Decimal("0")
+            consumed = Decimal("0")
+            for row in rows:
+                qty = to_decimal(str(row["actual_qty"]))
+                stock += qty
+                if qty < 0 and row["posting_date"] >= history_start.isoformat():
+                    consumed -= qty
+            demand = consumed * Decimal(horizon) / Decimal(history)
+            projected = stock - demand
+            available = projected if trigger == "forecast" else stock
+            triggered = due and available <= minimum and available < maximum
+            proposal = max(Decimal("0"), maximum - available) if triggered else Decimal("0")
+            def quantity(value):
+                return str(value.quantize(DEMAND_QTY_PRECISION, rounding=ROUND_HALF_UP))
+            results.append({
+                "item_id": item_id, "item_code": found["item_code"],
+                "item_name": found["item_name"], "warehouse_id": warehouse_id,
+                "min_qty": quantity(minimum), "max_qty": quantity(maximum),
+                "current_stock": quantity(stock), "projected_demand": quantity(demand),
+                "projected_stock": quantity(projected), "reorder_qty": quantity(proposal),
+                "trigger": trigger, "triggered": triggered, "review_due": due,
+                "review_due_date": due_date.isoformat(), "next_review_date": next_review.isoformat(),
+                "history_days": history, "horizon_days": horizon, "interval_days": interval,
+            })
+    proposals = [row for row in results if row["triggered"]]
+    ok({"company_id": company, "as_of_date": as_of.isoformat(),
+        "rules": results, "items": proposals, "items_below_reorder": len(proposals),
+        "basis": "posted_stock_and_outbound_history", "rules_saved": False,
+        "limits": "Caller-managed rules and review dates; no reservation or open-order netting, purchase creation or scheduling"})
+
+
+# ---------------------------------------------------------------------------
+# inventory-demand-forecast
+# ---------------------------------------------------------------------------
+
+# Quantities on the demand forecast are reported at six decimal places.
+DEMAND_QTY_PRECISION = Decimal("0.000001")
+
+# History and horizon windows are explicit day counts, capped at one leap year.
+DEMAND_MAX_DAYS = 366
+
+
+def _parse_demand_date(raw, flag):
+    """Require an ISO calendar date (YYYY-MM-DD) for a demand forecast flag."""
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        err(f"{flag} is required")
+    if not isinstance(raw, str):
+        err(f"{flag} must be an ISO date (YYYY-MM-DD)")
+    text = raw.strip()
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        err(f"{flag} must be an ISO date (YYYY-MM-DD)")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        err(f"{flag} must be an ISO date (YYYY-MM-DD)")
+
+
+def _parse_demand_days(raw, flag):
+    """Require a positive integer day count in 1..366 for a forecast flag."""
+    if raw is None or (isinstance(raw, str) and str(raw).strip() == ""):
+        err(f"{flag} is required")
+    if isinstance(raw, bool):
+        err(f"{flag} must be a positive integer (1-366)")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text.isdigit():
+            err(f"{flag} must be a positive integer (1-366)")
+        value = int(text)
+    elif isinstance(raw, int):
+        value = raw
+    else:
+        err(f"{flag} must be a positive integer (1-366)")
+    if value < 1 or value > DEMAND_MAX_DAYS:
+        err(f"{flag} must be a positive integer (1-366)")
+    return value
+
+
+def inventory_demand_forecast(conn, args):
+    """Historical consumption forecast for an item in a warehouse.
+
+    Transparent baseline, not a purchase recommendation: sums the absolute
+    value of posted (non-cancelled) outbound stock ledger quantities over the
+    inclusive history window ending on --as-of-date, divides by the history
+    day count for the daily velocity, and projects that exact rate over the
+    horizon day count. Read only: posts no ledger, GL, or audit rows.
+    """
+    company_id_arg = getattr(args, "company_id", None)
+    company_name_arg = getattr(args, "company_name", None)
+    if not company_id_arg and not company_name_arg:
+        err("--company-id is required")
+    item_id = getattr(args, "item_id", None)
+    if not item_id:
+        err("--item-id is required")
+    warehouse_id = getattr(args, "warehouse_id", None)
+    if not warehouse_id:
+        err("--warehouse-id is required")
+    as_of_date = _parse_demand_date(
+        getattr(args, "as_of_date", None), "--as-of-date")
+    history_days = _parse_demand_days(
+        getattr(args, "history_days", None), "--history-days")
+    horizon_days = _parse_demand_days(
+        getattr(args, "horizon_days", None), "--horizon-days")
+
+    company_id = resolve_scope_company(conn, company_id_arg, company_name_arg)
+
+    item_t = Table("item")
+    item_q = (Q.from_(item_t)
+              .select(item_t.id)
+              .where(item_t.id == P()))
+    if not conn.execute(item_q.get_sql(), (item_id,)).fetchone():
+        err(f"Item {item_id} not found")
+
+    wh_t = Table("warehouse")
+    wh_q = (Q.from_(wh_t)
+            .select(wh_t.id, wh_t.company_id)
+            .where(wh_t.id == P()))
+    wh_row = conn.execute(wh_q.get_sql(), (warehouse_id,)).fetchone()
+    if not wh_row:
+        err(f"Warehouse {warehouse_id} not found")
+    if wh_row["company_id"] != company_id:
+        err(f"Warehouse {warehouse_id} belongs to another company")
+
+    window_end = as_of_date
+    window_start = as_of_date - timedelta(days=history_days - 1)
+
+    sle = Table("stock_ledger_entry")
+    rows_q = (Q.from_(sle)
+              .select(sle.actual_qty)
+              .where(sle.item_id == P())
+              .where(sle.warehouse_id == P())
+              .where(sle.is_cancelled == 0)
+              .where(sle.posting_date >= P())
+              .where(sle.posting_date <= P()))
+    rows = conn.execute(
+        rows_q.get_sql(),
+        (item_id, warehouse_id,
+         window_start.isoformat(), window_end.isoformat()),
+    ).fetchall()
+
+    total_consumed = Decimal("0")
+    rows_used = 0
+    for row in rows:
+        qty = to_decimal(str(row["actual_qty"]))
+        if qty < 0:
+            total_consumed += -qty
+            rows_used += 1
+
+    daily_velocity = (total_consumed / Decimal(history_days)).quantize(
+        DEMAND_QTY_PRECISION, rounding=ROUND_HALF_UP)
+    projected_demand = (daily_velocity * Decimal(horizon_days)).quantize(
+        DEMAND_QTY_PRECISION, rounding=ROUND_HALF_UP)
+
+    ok({
+        "company_id": company_id,
+        "item_id": item_id,
+        "warehouse_id": warehouse_id,
+        "as_of_date": window_end.isoformat(),
+        "history_days": history_days,
+        "horizon_days": horizon_days,
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "basis": "posted_outbound_stock",
+        "rows_used": rows_used,
+        "total_consumed": str(total_consumed.quantize(
+            DEMAND_QTY_PRECISION, rounding=ROUND_HALF_UP)),
+        "daily_velocity": str(daily_velocity),
+        "projected_demand": str(projected_demand),
+    })
+
+
+# ---------------------------------------------------------------------------
+# standard-cost-variance-report
+# ---------------------------------------------------------------------------
+
+def _parse_variance_date(raw, flag):
+    """Require an ISO calendar date (YYYY-MM-DD) for a variance report flag."""
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        err(f"{flag} is required")
+    if not isinstance(raw, str):
+        err(f"{flag} must be an ISO date (YYYY-MM-DD)")
+    text = raw.strip()
+    if len(text) != 10 or text[4] != "-" or text[7] != "-":
+        err(f"{flag} must be an ISO date (YYYY-MM-DD)")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        err(f"{flag} must be an ISO date (YYYY-MM-DD)")
+
+
+def standard_cost_variance_report(conn, args):
+    """Read-only standard cost variance report for one company and date range.
+
+    Uses existing posted (non-cancelled) stock ledger rows only: each row's
+    quantity is valued at the item's standard_rate (standard value) and
+    compared with the row's posted stock_value_difference (actual value).
+    The variance is actual minus standard. All money is exact Decimal,
+    quantized to two places. Company scope comes from the row's warehouse.
+    Optional item and warehouse filters narrow the rows; a foreign or
+    missing filter record is refused. Posts nothing: no ledger, GL, or
+    audit row is written.
+    """
+    company_id_arg = getattr(args, "company_id", None)
+    company_name_arg = getattr(args, "company_name", None)
+    if not company_id_arg and not company_name_arg:
+        err("--company-id is required")
+    from_date = _parse_variance_date(
+        getattr(args, "from_date", None), "--from-date")
+    to_date = _parse_variance_date(
+        getattr(args, "to_date", None), "--to-date")
+    if from_date > to_date:
+        err("--from-date must not be later than --to-date")
+
+    company_id = resolve_scope_company(conn, company_id_arg, company_name_arg)
+
+    item_id = getattr(args, "item_id", None)
+    warehouse_id = getattr(args, "warehouse_id", None)
+
+    if item_id:
+        item_t = Table("item")
+        item_q = (Q.from_(item_t)
+                  .select(item_t.id)
+                  .where(item_t.id == P()))
+        if not conn.execute(item_q.get_sql(), (item_id,)).fetchone():
+            err(f"Item {item_id} not found")
+
+    if warehouse_id:
+        wh_t = Table("warehouse")
+        wh_q = (Q.from_(wh_t)
+                .select(wh_t.id, wh_t.company_id)
+                .where(wh_t.id == P()))
+        wh_row = conn.execute(wh_q.get_sql(), (warehouse_id,)).fetchone()
+        if not wh_row:
+            err(f"Warehouse {warehouse_id} not found")
+        if wh_row["company_id"] != company_id:
+            err(f"Warehouse {warehouse_id} belongs to another company")
+
+    sle = Table("stock_ledger_entry").as_("sle")
+    item_alias = Table("item").as_("i")
+    wh_alias = Table("warehouse").as_("w")
+
+    rows_q = (Q.from_(sle)
+              .join(item_alias).on(item_alias.id == sle.item_id)
+              .join(wh_alias).on(wh_alias.id == sle.warehouse_id)
+              .select(
+                  sle.id.as_("sle_id"),
+                  sle.posting_date,
+                  sle.created_at,
+                  sle.item_id,
+                  sle.warehouse_id,
+                  sle.actual_qty,
+                  sle.stock_value_difference,
+                  sle.valuation_rate,
+                  item_alias.item_code,
+                  item_alias.item_name,
+                  item_alias.standard_rate,
+                  wh_alias.name.as_("warehouse_name"))
+              .where(wh_alias.company_id == P())
+              .where(sle.is_cancelled == 0)
+              .where(sle.posting_date >= P())
+              .where(sle.posting_date <= P())
+              .orderby(sle.posting_date, order=Order.asc)
+              .orderby(sle.created_at, order=Order.asc)
+              .orderby(sle.id, order=Order.asc))
+
+    params = [company_id, from_date.isoformat(), to_date.isoformat()]
+    if item_id:
+        rows_q = rows_q.where(sle.item_id == P())
+        params.append(item_id)
+    if warehouse_id:
+        rows_q = rows_q.where(sle.warehouse_id == P())
+        params.append(warehouse_id)
+
+    rows = conn.execute(rows_q.get_sql(), params).fetchall()
+
+    details = []
+    total_quantity = Decimal("0")
+    total_standard = Decimal("0")
+    total_actual = Decimal("0")
+    for row in rows:
+        qty = to_decimal(str(row["actual_qty"]))
+        std_rate = to_decimal(str(row["standard_rate"]
+                                  if row["standard_rate"] is not None else "0"))
+        standard_value = round_currency(qty * std_rate)
+        actual_value = round_currency(to_decimal(str(row["stock_value_difference"])))
+        variance = round_currency(actual_value - standard_value)
+        total_quantity += qty
+        total_standard += standard_value
+        total_actual += actual_value
+        details.append({
+            "stock_ledger_entry_id": row["sle_id"],
+            "posting_date": row["posting_date"],
+            "item_id": row["item_id"],
+            "item_code": row["item_code"],
+            "item_name": row["item_name"],
+            "warehouse_id": row["warehouse_id"],
+            "warehouse_name": row["warehouse_name"],
+            "quantity": str(round_currency(qty)),
+            "qty": str(round_currency(qty)),
+            "standard_rate": str(round_currency(std_rate)),
+            "standard_value": str(standard_value),
+            "actual_value": str(actual_value),
+            "variance": str(variance),
+        })
+
+    total_quantity_s = str(round_currency(total_quantity))
+    total_standard_s = str(round_currency(total_standard))
+    total_actual_s = str(round_currency(total_actual))
+    total_variance_s = str(round_currency(total_actual - total_standard))
+
+    ok({
+        "company_id": company_id,
+        "item_id": item_id,
+        "warehouse_id": warehouse_id,
+        "from_date": from_date.isoformat(),
+        "to_date": to_date.isoformat(),
+        "scope": "recorded_stock_rows",
+        "basis": "recorded_stock_rows",
+        "details": details,
+        "rows": details,
+        "row_count": len(details),
+        "count": len(details),
+        "totals": {
+            "quantity": total_quantity_s,
+            "standard_value": total_standard_s,
+            "actual_value": total_actual_s,
+            "variance": total_variance_s,
+        },
+        "total_quantity": total_quantity_s,
+        "quantity": total_quantity_s,
+        "total_standard_value": total_standard_s,
+        "standard_value": total_standard_s,
+        "total_actual_value": total_actual_s,
+        "actual_value": total_actual_s,
+        "total_variance": total_variance_s,
+        "variance": total_variance_s,
     })
 
 
@@ -2902,20 +3987,25 @@ def get_projected_qty(conn, args):
     if not wh:
         err(f"Warehouse {args.warehouse_id} not found")
 
+    wh_company = _warehouse_company_guard(conn, args, args.warehouse_id)
+
     # 1. Actual qty from SLE
     balance = get_stock_balance(conn, args.item_id, args.warehouse_id)
     actual_qty = to_decimal(balance["qty"])
 
     # 2. Ordered qty: open PO items not yet fully received
     # PO statuses that indicate pending receipt: confirmed, partially_received
+    poi_t = Table("purchase_order_item")
+    po_t = Table("purchase_order")
+    po_q = (Q.from_(poi_t).join(po_t).on(po_t.id == poi_t.purchase_order_id)
+            .select(poi_t.quantity, poi_t.received_qty)
+            .where(poi_t.item_id == P())
+            .where((poi_t.warehouse_id == P()) | poi_t.warehouse_id.isnull())
+            .where(po_t.status.isin([P(), P()]))
+            .where(po_t.company_id == P()))
     po_rows = conn.execute(
-        """SELECT poi.quantity, poi.received_qty
-        FROM purchase_order_item poi
-        JOIN purchase_order po ON po.id = poi.purchase_order_id
-        WHERE poi.item_id = ?
-          AND (poi.warehouse_id = ? OR poi.warehouse_id IS NULL)
-          AND po.status IN ('confirmed', 'partially_received')""",
-        (args.item_id, args.warehouse_id),
+        po_q.get_sql(),
+        (args.item_id, args.warehouse_id, "confirmed", "partially_received", wh_company),
     ).fetchall()
     ordered_qty = round_currency(sum(
         (max(to_decimal(r["quantity"]) - to_decimal(r["received_qty"]), Decimal("0")) for r in po_rows),
@@ -2938,14 +4028,17 @@ def get_projected_qty(conn, args):
         ))
     else:
         # Fallback: SO statuses indicating pending delivery (confirmed, partially_delivered).
+        soi_t = Table("sales_order_item")
+        so_t = Table("sales_order")
+        so_q = (Q.from_(soi_t).join(so_t).on(so_t.id == soi_t.sales_order_id)
+                .select(soi_t.quantity, soi_t.delivered_qty)
+                .where(soi_t.item_id == P())
+                .where((soi_t.warehouse_id == P()) | soi_t.warehouse_id.isnull())
+                .where(so_t.status.isin([P(), P()]))
+                .where(so_t.company_id == P()))
         so_rows = conn.execute(
-            """SELECT soi.quantity, soi.delivered_qty
-            FROM sales_order_item soi
-            JOIN sales_order so_ ON so_.id = soi.sales_order_id
-            WHERE soi.item_id = ?
-              AND (soi.warehouse_id = ? OR soi.warehouse_id IS NULL)
-              AND so_.status IN ('confirmed', 'partially_delivered')""",
-            (args.item_id, args.warehouse_id),
+            so_q.get_sql(),
+            (args.item_id, args.warehouse_id, "confirmed", "partially_delivered", wh_company),
         ).fetchall()
         reserved_qty = round_currency(sum(
             (max(to_decimal(r["quantity"]) - to_decimal(r["delivered_qty"]), Decimal("0")) for r in so_rows),
@@ -3528,6 +4621,100 @@ def _resolve_putaway_target(conn, company_id, item_id, item_group_value):
         if row:
             return row["target_warehouse_id"]
     return None
+
+
+def create_putaway_transfer(conn, args):
+    """Apply current receipt routing to an ordinary, unsubmitted transfer."""
+    company_id = getattr(args, "company_id", None)
+    receipt_id = getattr(args, "stock_entry_id", None)
+    posting_date = getattr(args, "posting_date", None)
+    if not company_id or not receipt_id or not posting_date:
+        err("--company-id, --stock-entry and --posting-date are required")
+    try:
+        if datetime.strptime(posting_date, "%Y-%m-%d").date().isoformat() != posting_date:
+            raise ValueError
+    except (ValueError, TypeError):
+        err("--posting-date must be an ISO date")
+    se, line, item, group = (Table(name) for name in
+                             ("stock_entry", "stock_entry_item", "item", "item_group"))
+    query = (Q.from_(se).select(se.id, se.posting_date).where(se.id == P())
+             .where(se.company_id == P()).where(se.status == "submitted")
+             .where(se.stock_entry_type == "material_receipt"))
+    receipt = conn.execute(query.get_sql(), (receipt_id, company_id)).fetchone()
+    if not receipt:
+        err("An owned submitted material receipt is required")
+    if posting_date < receipt["posting_date"]:
+        err("Putaway posting date cannot precede the receipt")
+    query = (Q.from_(se).select(se.id, se.naming_series, se.status)
+             .where(se.company_id == P()).where(se.purpose_reference_type == "putaway_receipt")
+             .where(se.purpose_reference_id == P()).where(se.status.isin(("draft", "submitted")))
+             .orderby(se.id).limit(1))
+    existing = conn.execute(query.get_sql(), (company_id, receipt_id)).fetchone()
+    if existing:
+        ok({"stock_entry_id": existing["id"], "naming_series": existing["naming_series"],
+            "existing_transfer": True, "transfer_status": existing["status"]})
+    query = (Q.from_(line).join(se).on(line.stock_entry_id == se.id)
+             .join(item).on(line.item_id == item.id).left_join(group)
+             .on((item.item_group_id == group.id)
+                 & ((group.company_id == P()) | group.company_id.isnull()))
+             .select(line.item_id, line.quantity, line.to_warehouse_id, item.standard_rate,
+                     item.has_batch, item.has_serial, item.is_stock_item, item.status,
+                     group.name.as_("group_name"))
+             .where(se.id == P()).where(se.company_id == P()).orderby(line.id))
+    rows = conn.execute(query.get_sql(), (company_id, receipt_id, company_id)).fetchall()
+    moves, required = [], {}
+    wh, rule, reservation = Table("warehouse"), Table("putaway_rule"), Table("stock_reservation_entry")
+    for row in rows:
+        match = None
+        for column, value in ((rule.match_item_id, row["item_id"]),
+                              (rule.match_item_group, row["group_name"])):
+            if not value:
+                continue
+            query = (Q.from_(rule).select(rule.target_warehouse_id).where(rule.company_id == P())
+                     .where(rule.is_active == 1).where(column == P())
+                     .orderby(rule.priority, rule.created_at, rule.id).limit(1))
+            match = conn.execute(query.get_sql(), (company_id, value)).fetchone()
+            if match:
+                break
+        if not match or match["target_warehouse_id"] == row["to_warehouse_id"]:
+            continue
+        source_id, target_id = row["to_warehouse_id"], match["target_warehouse_id"]
+        for warehouse_id in (source_id, target_id):
+            query = (Q.from_(wh).select(wh.id).where(wh.id == P())
+                     .where(wh.company_id == P()).where(wh.is_group == 0))
+            if not conn.execute(query.get_sql(), (warehouse_id, company_id)).fetchone():
+                err("Every putaway source and target must be an owned leaf warehouse")
+        if (row["has_batch"] or row["has_serial"] or not row["is_stock_item"]
+                or row["status"] != "active"):
+            err("Putaway requires active untracked stock items; use an explicit transfer for batches or serials")
+        try:
+            quantity, rate = Decimal(row["quantity"]), Decimal(row["standard_rate"])
+            if (not quantity.is_finite() or quantity <= 0 or quantity > Decimal("1000000000")
+                    or quantity != round_currency(quantity) or not rate.is_finite()
+                    or rate < 0 or rate > Decimal("1000000000000")):
+                raise ValueError
+        except (ValueError, InvalidOperation):
+            err("Putaway quantities and item rates must be finite, nonnegative and within supported limits")
+        key = (row["item_id"], source_id)
+        required[key] = required.get(key, Decimal("0")) + quantity
+        moves.append({"item_id": row["item_id"], "qty": str(quantity),
+                      "from_warehouse_id": source_id, "to_warehouse_id": target_id})
+    if not moves:
+        ok({"created": False, "reason": "No received line needs a putaway transfer"})
+    for (item_id, source_id), quantity in required.items():
+        available = to_decimal(get_stock_balance(conn, item_id, source_id, posting_date)["qty"])
+        query = (Q.from_(reservation).join(wh).on(reservation.warehouse_id == wh.id)
+                 .select(reservation.reserved_qty).where(reservation.company_id == P())
+                 .where(wh.company_id == P()).where(reservation.item_id == P())
+                 .where(reservation.warehouse_id == P()).where(reservation.status == "active"))
+        reserved = sum((to_decimal(r["reserved_qty"]) for r in conn.execute(
+            query.get_sql(), (company_id, company_id, item_id, source_id)).fetchall()), Decimal("0"))
+        if quantity > Decimal("1000000000") or available - reserved < quantity:
+            err("Putaway source has insufficient unreserved stock for all routed lines")
+    transfer_args = argparse.Namespace(**vars(args))
+    transfer_args.entry_type = "transfer"
+    transfer_args.items = json.dumps(moves)
+    add_stock_entry(conn, transfer_args, purpose_reference=("putaway_receipt", receipt_id))
 
 
 def apply_putaway_on_receipt(conn, args):
@@ -4166,6 +5353,9 @@ def remove_item_alternative(conn, args):
 # ---------------------------------------------------------------------------
 
 ACTIONS = {
+    "add-item-barcode": add_item_barcode,
+    "add-scanned-stock-entry": add_scanned_stock_entry,
+    "add-scanned-stock-count": add_scanned_stock_count,
     "add-item": add_item,
     "update-item": update_item,
     "get-item": get_item,
@@ -4174,9 +5364,11 @@ ACTIONS = {
     "add-item-group": add_item_group,
     "list-item-groups": list_item_groups,
     "add-warehouse": add_warehouse,
+    "add-bin-location": add_bin_location,
     "update-warehouse": update_warehouse,
     "list-warehouses": list_warehouses,
     "add-stock-entry": add_stock_entry,
+    "add-location-resupply": add_location_resupply,
     "add-repack-stock-entry": add_repack_stock_entry,
     "add-material-consumption": add_material_consumption,
     "get-stock-entry": get_stock_entry,
@@ -4191,6 +5383,7 @@ ACTIONS = {
     "stock-balance": stock_balance_report,  # alias — "stock balance" routes to company-wide report
     "stock-balance-report": stock_balance_report,
     "stock-ledger-report": stock_ledger_report,
+    "standard-cost-variance-report": standard_cost_variance_report,
     "add-batch": add_batch,
     "list-batches": list_batches,
     "add-serial-number": add_serial_number,
@@ -4206,6 +5399,7 @@ ACTIONS = {
     "get-stock-revaluation": get_stock_revaluation,
     "cancel-stock-revaluation": cancel_stock_revaluation,
     "check-reorder": check_reorder,
+    "inventory-demand-forecast": inventory_demand_forecast,
     "import-items": import_items,
     "get-projected-qty": get_projected_qty,
     "add-item-attribute": add_item_attribute,
@@ -4221,6 +5415,7 @@ ACTIONS = {
     "update-putaway-rule": update_putaway_rule,
     "delete-putaway-rule": delete_putaway_rule,
     "apply-putaway-on-receipt": apply_putaway_on_receipt,
+    "create-putaway-transfer": create_putaway_transfer,
     "create-pick-list": create_pick_list,
     "add-pick-list-item": add_pick_list_item,
     "submit-pick-list": submit_pick_list,
@@ -4241,6 +5436,8 @@ ACTIONS = {
 def main():
     parser = SafeArgumentParser(description="ERPClaw Inventory Skill")
     parser.add_argument("--action", required=True, choices=sorted(ACTIONS.keys()))
+    parser.add_argument("--barcode")
+    parser.add_argument("--scans")
     parser.add_argument("--db-path", default=None)
 
     # Item fields
@@ -4256,6 +5453,7 @@ def main():
     parser.add_argument("--standard-rate")
     parser.add_argument("--reorder-level")
     parser.add_argument("--reorder-qty")
+    parser.add_argument("--reorder-rules")
     parser.add_argument("--status", dest="item_status")
 
     # Item group
@@ -4328,6 +5526,11 @@ def main():
     parser.add_argument("--pricing-rule-rate", dest="pr_rate")
     parser.add_argument("--priority", type=int, default=None)
 
+    # inventory-demand-forecast
+    parser.add_argument("--as-of-date")
+    parser.add_argument("--history-days")
+    parser.add_argument("--horizon-days")
+
     # Stock reconciliation
     parser.add_argument("--stock-reconciliation-id")
 
@@ -4380,12 +5583,17 @@ def main():
     parser.add_argument("--custom-fields", default=None,
                         help='User-defined fields as a JSON object, e.g. \'{"hs_code": "8471"}\'')
 
+    parser.add_argument("--dimensions", default=None)
+    parser.add_argument("--dimension-key", dest="dimension_key",
+                        action="append", default=None)
+    parser.add_argument("--dimension-value", dest="dimension_value",
+                        action="append", default=None)
+
     args, unknown = parser.parse_known_args()
     check_unknown_args(parser, unknown)
     check_input_lengths(args)
 
-    db_path = args.db_path or DEFAULT_DB_PATH
-    ensure_db_exists(db_path)
+    db_path = getattr(args, "db_path", None)   # None unless --db-path was given
     conn = get_connection(db_path)
 
     # Dependency check
@@ -4401,7 +5609,7 @@ def main():
     except Exception as e:
         conn.rollback()
         sys.stderr.write(f"[erpclaw-inventory] {e}\n")
-        err("An unexpected error occurred")
+        err(unexpected_error_message(e))
     finally:
         conn.close()
 
